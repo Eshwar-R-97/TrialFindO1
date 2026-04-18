@@ -2,7 +2,9 @@ const findBtn = document.getElementById("findTrialsBtn");
 const clearLogsBtn = document.getElementById("clearLogsBtn");
 const statusText = document.getElementById("statusText");
 const errorBox = document.getElementById("errorBox");
-const scoredResults = document.getElementById("scoredResults");
+const scoredTbody = document.getElementById("scoredTbody");
+const scoredTableWrap = document.getElementById("scoredTableWrap");
+const scoredEmpty = document.getElementById("scoredEmpty");
 const scoredCount = document.getElementById("scoredCount");
 const rawResults = document.getElementById("rawResults");
 const rawCount = document.getElementById("rawCount");
@@ -25,8 +27,10 @@ function setStatus(message) {
 }
 
 function clearResults() {
-  scoredResults.innerHTML =
-    '<p class="empty-hint">Scored matches will appear here once Step 3 finishes.</p>';
+  scoredTbody.innerHTML = "";
+  scoredTableWrap.classList.add("hidden");
+  scoredEmpty.classList.remove("hidden");
+  scoredEmpty.textContent = "Scored matches will appear here once Step 3 finishes.";
   rawResults.innerHTML = "";
   rawTrialsCount = 0;
   scoredTrialsCount = 0;
@@ -108,6 +112,32 @@ function appendLog({ message, step, ts }) {
   logPanel.scrollTop = logPanel.scrollHeight;
 }
 
+function firstSentence(text, maxLen = 160) {
+  if (!text) return "";
+  const match = String(text).match(/^.*?[.!?](?:\s|$)/);
+  const first = (match ? match[0] : String(text)).trim();
+  return first.length > maxLen ? first.slice(0, maxLen - 1) + "…" : first;
+}
+
+function trialSourceUrl(trial) {
+  if (trial.nct_url) return trial.nct_url;
+  if (trial.nct_id) return `https://clinicaltrials.gov/study/${trial.nct_id}`;
+  if (trial.mayo_url) return trial.mayo_url;
+  return "";
+}
+
+function trialLocationLabel(trial) {
+  const loc = (trial.location || "").trim();
+  if (loc && loc.toLowerCase() !== "unknown") return loc;
+  return "Location not listed";
+}
+
+function eligibilitySnippet(text, maxLen = 220) {
+  if (!text) return "Not provided.";
+  const cleaned = String(text).replace(/\s+/g, " ").trim();
+  return cleaned.length > maxLen ? cleaned.slice(0, maxLen - 1) + "…" : cleaned;
+}
+
 function appendRawTrial(trial) {
   if (rawTrialsCount === 0) {
     rawResults.innerHTML = "";
@@ -117,31 +147,47 @@ function appendRawTrial(trial) {
   rawCount.textContent = String(rawTrialsCount);
   rawCount.classList.remove("hidden");
 
-  const article = document.createElement("article");
-  article.className = "card fade-in";
-  article.innerHTML = `
-    <h3>${escapeHtml(trial.title)}</h3>
-    <p class="meta">
-      Source: ${escapeHtml(trial.source)} |
-      NCT ID: ${escapeHtml(trial.nct_id || "N/A")} |
-      Phase: ${escapeHtml(trial.phase || "Unknown")} |
-      Location: ${escapeHtml(trial.location || "Unknown")}
-    </p>
-    <p><strong>Summary:</strong> ${escapeHtml(trial.summary || "N/A")}</p>
-    <p><strong>Eligibility:</strong> ${escapeHtml(trial.eligibility_criteria || "N/A")}</p>
+  const sourceUrl = trialSourceUrl(trial);
+  const linkHtml = sourceUrl
+    ? `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>`
+    : "";
+
+  const details = document.createElement("details");
+  details.className = "trial-card fade-in";
+  details.innerHTML = `
+    <summary class="trial-summary">
+      <div class="trial-summary-top">
+        <span class="trial-source-tag">${escapeHtml(trial.source || "Unknown")}</span>
+        <h3 class="trial-title">${escapeHtml(trial.title || "Untitled trial")}</h3>
+      </div>
+      <div class="trial-summary-meta">
+        <span>📍 ${escapeHtml(trialLocationLabel(trial))}</span>
+        <span>🧪 Phase: ${escapeHtml(trial.phase || "Unknown")}</span>
+        ${trial.nct_id ? `<span>ID: ${escapeHtml(trial.nct_id)}</span>` : ""}
+      </div>
+      <p class="trial-quick">${escapeHtml(firstSentence(trial.summary) || "No short summary available.")}</p>
+    </summary>
+    <div class="trial-body">
+      <p><strong>Full summary:</strong> ${escapeHtml(trial.summary || "Not provided.")}</p>
+      <p><strong>Eligibility criteria:</strong> ${escapeHtml(trial.eligibility_criteria || "Not provided.")}</p>
+      ${linkHtml ? `<p>${linkHtml}</p>` : ""}
+    </div>
   `;
-  rawResults.appendChild(article);
+  rawResults.appendChild(details);
 }
 
-function appendScoredTrial({ trial, score }) {
-  if (scoredTrialsCount === 0) {
-    scoredResults.innerHTML = "";
-  }
-  scoredTrialsCount += 1;
-  scoredCount.textContent = String(scoredTrialsCount);
-  scoredCount.classList.remove("hidden");
+function scoreNumeric(score) {
+  const n = Number(score?.match_score);
+  return Number.isFinite(n) ? n : -1;
+}
 
+function buildScoredRows({ trial, score }) {
   const level = (score.match_level || "low").toLowerCase();
+  const scoreNum = score.match_score ?? "–";
+  const sourceUrl = trialSourceUrl(trial);
+  const linkHtml = sourceUrl
+    ? `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener">View source ↗</a>`
+    : "";
   const factors = (score.key_eligibility_factors || [])
     .map((item) => `<li>${escapeHtml(item)}</li>`)
     .join("");
@@ -149,23 +195,98 @@ function appendScoredTrial({ trial, score }) {
     .map((item) => `<li>${escapeHtml(item)}</li>`)
     .join("");
 
-  const article = document.createElement("article");
-  article.className = "card fade-in";
-  article.innerHTML = `
-    <h3>${escapeHtml(trial.title)}</h3>
-    <p class="meta">
-      Source: ${escapeHtml(trial.source)} |
-      Score: ${escapeHtml(score.match_score)}
-      <span class="badge ${escapeHtml(level)}">${escapeHtml(level)}</span>
-    </p>
-    <p><strong>Summary:</strong> ${escapeHtml(score.plain_english_summary)}</p>
-    <p><strong>Rationale:</strong> ${escapeHtml(score.rationale)}</p>
-    <p><strong>Key factors:</strong></p>
-    <ul>${factors || "<li>None provided</li>"}</ul>
-    <p><strong>Potential exclusions:</strong></p>
-    <ul>${exclusions || "<li>None provided</li>"}</ul>
+  const main = document.createElement("tr");
+  main.className = "trial-row";
+  main.dataset.score = String(scoreNumeric(score));
+  main.innerHTML = `
+    <td class="col-score">
+      <span class="score-chip level-${escapeHtml(level)}">
+        ${escapeHtml(scoreNum)}<small>${escapeHtml(level)}</small>
+      </span>
+    </td>
+    <td class="col-source">
+      <span class="trial-source-tag">${escapeHtml(trial.source || "Unknown")}</span>
+    </td>
+    <td class="col-title">
+      <span class="cell-title">${escapeHtml(trial.title || "Untitled trial")}</span>
+      ${trial.nct_id ? `<span class="cell-sub">${escapeHtml(trial.nct_id)}</span>` : ""}
+    </td>
+    <td class="col-summary">${escapeHtml(firstSentence(score.plain_english_summary) || "—")}</td>
+    <td class="col-location">${escapeHtml(trialLocationLabel(trial))}</td>
+    <td class="col-elig">${escapeHtml(eligibilitySnippet(trial.eligibility_criteria, 140))}</td>
   `;
-  scoredResults.appendChild(article);
+
+  const detail = document.createElement("tr");
+  detail.className = "trial-detail-row hidden";
+  detail.innerHTML = `
+    <td colspan="6">
+      <div class="trial-detail-body">
+        <p><strong>Plain-English summary:</strong> ${escapeHtml(score.plain_english_summary || "Not provided.")}</p>
+        <p><strong>Why this might or might not fit you:</strong> ${escapeHtml(score.rationale || "Not provided.")}</p>
+        <div class="detail-grid">
+          <div>
+            <p class="detail-label">Key things you'd need</p>
+            <ul>${factors || "<li>None provided</li>"}</ul>
+          </div>
+          <div>
+            <p class="detail-label">Things that could disqualify you</p>
+            <ul>${exclusions || "<li>None provided</li>"}</ul>
+          </div>
+        </div>
+        <p><strong>Full eligibility text:</strong> ${escapeHtml(trial.eligibility_criteria || "Not provided.")}</p>
+        <p><strong>Phase:</strong> ${escapeHtml(trial.phase || "Unknown")}
+          ${linkHtml ? ` &nbsp;•&nbsp; ${linkHtml}` : ""}
+        </p>
+      </div>
+    </td>
+  `;
+
+  main.addEventListener("click", () => {
+    const opened = main.classList.toggle("open");
+    detail.classList.toggle("hidden", !opened);
+  });
+
+  return { main, detail };
+}
+
+function appendScoredTrial(entry) {
+  if (scoredTrialsCount === 0) {
+    scoredEmpty.classList.add("hidden");
+    scoredTableWrap.classList.remove("hidden");
+  }
+  scoredTrialsCount += 1;
+  scoredCount.textContent = String(scoredTrialsCount);
+  scoredCount.classList.remove("hidden");
+
+  const { main, detail } = buildScoredRows(entry);
+  main.classList.add("fade-in");
+  const newScore = Number(main.dataset.score);
+
+  // Insert in score-descending order so the best matches bubble to the top.
+  const existingRows = scoredTbody.querySelectorAll("tr.trial-row");
+  let inserted = false;
+  for (const row of existingRows) {
+    if (Number(row.dataset.score) < newScore) {
+      scoredTbody.insertBefore(main, row);
+      scoredTbody.insertBefore(detail, main.nextSibling);
+      inserted = true;
+      break;
+    }
+  }
+  if (!inserted) {
+    scoredTbody.appendChild(main);
+    scoredTbody.appendChild(detail);
+  }
+
+  // Auto-open the top scorer for visibility.
+  if (scoredTrialsCount === 1 || Number(scoredTbody.querySelector("tr.trial-row").dataset.score) === newScore) {
+    const topRow = scoredTbody.querySelector("tr.trial-row");
+    const topDetail = topRow.nextElementSibling;
+    if (topRow && topDetail && !topRow.classList.contains("open")) {
+      topRow.classList.add("open");
+      topDetail.classList.remove("hidden");
+    }
+  }
 }
 
 function finishRun({ data, errorMessage } = {}) {
@@ -181,7 +302,9 @@ function finishRun({ data, errorMessage } = {}) {
     rawResults.innerHTML = "<p>No raw trials found.</p>";
   }
   if (scoredTrialsCount === 0) {
-    scoredResults.innerHTML = "<p>No scored trials available.</p>";
+    scoredEmpty.textContent = "No scored trials available.";
+    scoredEmpty.classList.remove("hidden");
+    scoredTableWrap.classList.add("hidden");
   }
   const errors = data.meta?.errors || [];
   if (errors.length) {

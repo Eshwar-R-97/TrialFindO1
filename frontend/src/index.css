@@ -1,0 +1,90 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 210 20% 98%;
+  --foreground: 222 47% 11%;
+  --card: 0 0% 100%;
+  --card-alt: 210 20% 98%;
+  --border: 214 32% 91%;
+  --muted: 210 20% 96%;
+  --muted-foreground: 215 16% 47%;
+  --primary: 173 80% 26%;
+  --primary-foreground: 0 0% 100%;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  background:
+    radial-gradient(1100px 580px at -10% -10%, rgba(20, 184, 166, 0.08), transparent 60%),
+    radial-gradient(900px 500px at 110% -20%, rgba(37, 99, 235, 0.06), transparent 55%),
+    hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+/* Scoped log panel styles. The rest of the UI is Tailwind utility classes. */
+.log-line {
+  display: block;
+  padding: 1px 0;
+}
+
+.log-line .ts {
+  color: #6b7a99;
+  margin-right: 0.55rem;
+}
+
+.log-line .step-tag {
+  margin-right: 0.4rem;
+  font-weight: 600;
+}
+
+.log-line.step-1 .step-tag,
+.log-line.step-1 .msg {
+  color: #86efac;
+}
+
+.log-line.step-2 .step-tag,
+.log-line.step-2 .msg {
+  color: #fde68a;
+}
+
+.log-line.step-3 .step-tag,
+.log-line.step-3 .msg {
+  color: #fdba74;
+}
+
+.log-line.error .step-tag,
+.log-line.error .msg {
+  color: #fca5a5;
+  font-weight: 600;
+}
+
+.log-line.system .msg {
+  color: #c4b5fd;
+}
+
+/* Nicer scrollbar on the log panel */
+.log-panel::-webkit-scrollbar {
+  width: 8px;
+}
+.log-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+.log-panel::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+}
+.log-panel::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.15);
+}

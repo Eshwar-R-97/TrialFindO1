@@ -3,69 +3,129 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>TrialFind MVP</title>
+    <title>TrialFind — Clinical Trial Matching</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
-    <main class="container">
-      <h1>TrialFind</h1>
-      <p class="subtitle">
-        Demo patient: stage 3 breast cancer, age 48, Minneapolis MN, prior chemotherapy.
-      </p>
+    <header class="app-header">
+      <div class="app-inner header-inner">
+        <div class="brand">
+          <span class="brand-mark">TF</span>
+          <div class="brand-text">
+            <h1>TrialFind</h1>
+            <p>AI-powered clinical trial matching</p>
+          </div>
+        </div>
+        <div class="header-actions">
+          <button id="findTrialsBtn" class="primary-btn">Find Trials</button>
+        </div>
+      </div>
+    </header>
 
-      <button id="findTrialsBtn">Find Trials</button>
-      <p id="statusText" class="status"></p>
-      <div id="errorBox" class="error hidden"></div>
-
-      <section class="step-cards" id="stepCards">
-        <article class="step-card" data-step="1" data-status="idle">
-          <div class="step-head">
-            <span class="step-num">1</span>
-            <h3 class="step-title">ClinicalTrials.gov API</h3>
-            <span class="step-badge">IDLE</span>
+    <main class="app-main app-inner">
+      <section class="hero-card">
+        <div class="hero-head">
+          <div>
+            <p class="eyebrow">Demo patient</p>
+            <h2 class="hero-title">Matching recruiting trials to your profile</h2>
           </div>
-          <p class="step-summary">Waiting to start.</p>
-        </article>
-        <article class="step-card" data-step="2" data-status="idle">
-          <div class="step-head">
-            <span class="step-num">2</span>
-            <h3 class="step-title">Mayo Clinic browser agent (Tinyfish)</h3>
-            <span class="step-badge">IDLE</span>
+          <div class="hero-status">
+            <p id="statusText" class="status">Click <strong>Find Trials</strong> to start the pipeline.</p>
           </div>
-          <p class="step-summary">Waiting to start.</p>
-        </article>
-        <article class="step-card" data-step="3" data-status="idle">
-          <div class="step-head">
-            <span class="step-num">3</span>
-            <h3 class="step-title">Featherless AI scoring</h3>
-            <span class="step-badge">IDLE</span>
-          </div>
-          <p class="step-summary">Waiting to start.</p>
-        </article>
+        </div>
+        <div class="patient-chips">
+          <span class="patient-chip"><span class="chip-label">Diagnosis</span><span>Stage 3 breast cancer</span></span>
+          <span class="patient-chip"><span class="chip-label">Age</span><span>48</span></span>
+          <span class="patient-chip"><span class="chip-label">Location</span><span>Minneapolis, MN</span></span>
+          <span class="patient-chip"><span class="chip-label">Prior treatment</span><span>Chemotherapy</span></span>
+        </div>
+        <div id="errorBox" class="error hidden"></div>
       </section>
 
-      <section>
-        <div class="log-header">
-          <h2>Live activity</h2>
-          <button id="clearLogsBtn" class="secondary" type="button">Clear</button>
+      <section class="panel">
+        <div class="panel-head">
+          <h3 class="panel-title">Pipeline</h3>
+          <p class="panel-sub">Three steps run sequentially. Each card updates in real time.</p>
+        </div>
+        <div class="step-cards" id="stepCards">
+          <article class="step-card" data-step="1" data-status="idle">
+            <div class="step-head">
+              <span class="step-num">1</span>
+              <h3 class="step-title">ClinicalTrials.gov API</h3>
+              <span class="step-badge">IDLE</span>
+            </div>
+            <p class="step-summary">Waiting to start.</p>
+          </article>
+          <article class="step-card" data-step="2" data-status="idle">
+            <div class="step-head">
+              <span class="step-num">2</span>
+              <h3 class="step-title">Mayo Clinic browser agent (Tinyfish)</h3>
+              <span class="step-badge">IDLE</span>
+            </div>
+            <p class="step-summary">Waiting to start.</p>
+          </article>
+          <article class="step-card" data-step="3" data-status="idle">
+            <div class="step-head">
+              <span class="step-num">3</span>
+              <h3 class="step-title">Featherless AI scoring</h3>
+              <span class="step-badge">IDLE</span>
+            </div>
+            <p class="step-summary">Waiting to start.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h3 class="panel-title">Live activity</h3>
+          <button id="clearLogsBtn" class="ghost-btn" type="button">Clear</button>
         </div>
         <div id="logPanel" class="log-panel" aria-live="polite"></div>
       </section>
 
-      <section>
-        <h2>Scored Matches <span id="scoredCount" class="count-pill hidden">0</span></h2>
-        <div id="scoredResults" class="results">
-          <p class="empty-hint">Scored matches will appear here once Step 3 finishes.</p>
+      <section class="panel">
+        <div class="panel-head">
+          <h3 class="panel-title">
+            Scored matches
+            <span id="scoredCount" class="count-pill hidden">0</span>
+          </h3>
+          <p class="panel-sub">Ranked best-fit first. Click any row for plain-English details.</p>
+        </div>
+        <p id="scoredEmpty" class="empty-hint">Scored matches will appear here once Step 3 finishes.</p>
+        <div id="scoredTableWrap" class="table-wrap hidden">
+          <table class="trial-table">
+            <thead>
+              <tr>
+                <th class="col-score">Score</th>
+                <th class="col-source">Source</th>
+                <th class="col-title">Title</th>
+                <th class="col-summary">One-line summary</th>
+                <th class="col-location">Location</th>
+                <th class="col-elig">Eligibility</th>
+              </tr>
+            </thead>
+            <tbody id="scoredTbody"></tbody>
+          </table>
         </div>
       </section>
 
-      <section>
-        <h2>Raw Trial Data <span id="rawCount" class="count-pill hidden">0</span></h2>
+      <section class="panel">
+        <div class="panel-head">
+          <h3 class="panel-title">
+            Raw trial data
+            <span id="rawCount" class="count-pill hidden">0</span>
+          </h3>
+          <p class="panel-sub">Unscored, freshly collected from each source.</p>
+        </div>
         <details id="rawDetails">
-          <summary>Show raw trials</summary>
+          <summary class="raw-toggle">Show raw trials</summary>
           <div id="rawResults" class="results"></div>
         </details>
       </section>
+
+      <footer class="app-footer">
+        <p>TrialFind MVP · data: ClinicalTrials.gov &amp; Mayo Clinic · scoring by Featherless AI</p>
+      </footer>
     </main>
     <script src="/static/app.js"></script>
   </body>

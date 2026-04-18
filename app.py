@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, render_template, stream_with_context
+from flask import Flask, Response, abort, jsonify, send_from_directory, stream_with_context
 from openai import OpenAI
 from tinyfish import TinyFish
 
@@ -69,7 +69,12 @@ class Reporter:
 
 load_dotenv()
 
-app = Flask(__name__)
+# Serve the built React app out of `frontend/dist`. During development the
+# React app is run via `npm run dev` (Vite on :5173) which proxies the
+# `/find-trials*` endpoints back to this Flask server. In production we build
+# once (`cd frontend && npm run build`) and Flask serves the static bundle.
+_REACT_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
+app = Flask(__name__, static_folder=None)
 
 DEMO_PATIENT = {
     "diagnosis": "stage 3 breast cancer",
@@ -164,6 +169,31 @@ def format_location(location: Dict[str, Any]) -> str:
     return ", ".join(cleaned) if cleaned else ""
 
 
+# Patient's preferred state/region — used to pick the most relevant trial site
+# out of the (often many) sites a ClinicalTrials.gov study has.
+PATIENT_PREFERRED_STATES = {"MINNESOTA", "MN"}
+
+
+def pick_best_location(locations: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the most patient-relevant location from a study's site list.
+
+    Preference order:
+    1. A site in the patient's preferred state.
+    2. The first site that has at least a city + state.
+    3. Whatever the first entry is.
+    """
+    if not locations:
+        return {}
+    for loc in locations:
+        state = (loc.get("state") or "").strip().upper()
+        if state in PATIENT_PREFERRED_STATES:
+            return loc
+    for loc in locations:
+        if (loc.get("city") or "").strip() and (loc.get("state") or "").strip():
+            return loc
+    return locations[0]
+
+
 def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     reporter.step(1, "running", "Querying ClinicalTrials.gov API...", title="ClinicalTrials.gov API")
     reporter.log("Searching ClinicalTrials.gov for recruiting breast cancer studies near Minneapolis MN.", step=1)
@@ -202,8 +232,8 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     normalized = []
     for idx, study in enumerate(studies[:5], start=1):
         sections = extract_protocol_section(study)
-        location_list = sections["contacts"].get("locations", [])
-        first_location = location_list[0] if location_list else {}
+        location_list = sections["contacts"].get("locations", []) or []
+        best_location = pick_best_location(location_list)
         phase_list = sections["design"].get("phases", [])
 
         nct_id = first_non_empty(
@@ -213,8 +243,23 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
             [sections["identification"].get("briefTitle"), study.get("briefTitle")]
         )
 
+        location_str = first_non_empty(
+            [
+                format_location(best_location),
+                best_location.get("city"),
+                study.get("locationCity"),
+            ],
+            "Location not listed",
+        )
+        sites_count = len(location_list)
+        if sites_count > 1:
+            location_display = f"{location_str} (+{sites_count - 1} more sites)"
+        else:
+            location_display = location_str
+
         trial_record = {
             "nct_id": nct_id,
+            "nct_url": f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else "",
             "title": title,
             "eligibility_criteria": truncate_text(
                 first_non_empty(
@@ -224,14 +269,8 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
                     ]
                 )
             ),
-            "location": first_non_empty(
-                [
-                    format_location(first_location),
-                    first_location.get("city"),
-                    study.get("locationCity"),
-                ],
-                "Unknown",
-            ),
+            "location": location_display,
+            "sites_count": sites_count,
             "phase": first_non_empty(phase_list, "Unknown"),
             "summary": truncate_text(
                 first_non_empty(
@@ -245,7 +284,8 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         }
         normalized.append(trial_record)
         reporter.log(
-            f"Normalized trial {idx}/{min(len(studies), 5)}: {nct_id or 'NCT?'} — {title[:80] if title else 'Untitled'}",
+            f"Normalized trial {idx}/{min(len(studies), 5)}: {nct_id or 'NCT?'} — "
+            f"{title[:80] if title else 'Untitled'} — {location_display}",
             step=1,
         )
         reporter.trial(trial_record)
@@ -626,9 +666,41 @@ def merge_trials_with_scores(
     return merged
 
 
+def _serve_index() -> Response:
+    index_path = os.path.join(_REACT_DIST, "index.html")
+    if not os.path.exists(index_path):
+        return Response(
+            "React build not found. Run:\n\n"
+            "    cd frontend && npm install && npm run build\n\n"
+            "then reload this page.",
+            status=503,
+            mimetype="text/plain",
+        )
+    return send_from_directory(_REACT_DIST, "index.html")
+
+
 @app.route("/")
-def index() -> str:
-    return render_template("index.html")
+def index() -> Response:
+    return _serve_index()
+
+
+@app.route("/assets/<path:filename>")
+def react_assets(filename: str) -> Response:
+    assets_dir = os.path.join(_REACT_DIST, "assets")
+    return send_from_directory(assets_dir, filename)
+
+
+# SPA fallback: serve real files from dist when they exist, otherwise serve
+# index.html. API routes (find-trials, find-trials-stream) take precedence
+# because they are registered above with more specific rules.
+@app.route("/<path:path>")
+def spa_fallback(path: str) -> Response:
+    if path.startswith(("find-trials", "api/")):
+        abort(404)
+    candidate = os.path.join(_REACT_DIST, path)
+    if os.path.isfile(candidate):
+        return send_from_directory(_REACT_DIST, path)
+    return _serve_index()
 
 
 def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
