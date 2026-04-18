@@ -1,0 +1,354 @@
+import json
+import os
+import re
+import time
+from typing import Any, Dict, List
+
+import requests
+from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template
+from openai import OpenAI
+from tinyfish import TinyFish
+
+load_dotenv()
+
+app = Flask(__name__)
+
+DEMO_PATIENT = {
+    "diagnosis": "stage 3 breast cancer",
+    "age": 48,
+    "location": "Minneapolis MN",
+    "prior_treatments": "chemotherapy",
+}
+
+CLINICAL_TRIALS_URL = (
+    "https://clinicaltrials.gov/api/v2/studies?"
+    "query.cond=breast+cancer&"
+    "filter.geo=distance(44.9778,-93.2650,100mi)&"
+    "filter.overallStatus=RECRUITING&"
+    "pageSize=5&"
+    "format=json"
+)
+
+FEATHERLESS_MODEL = os.getenv("FEATHERLESS_MODEL", "Qwen/Qwen2.5-72B-Instruct")
+FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
+
+
+def truncate_text(text: Any, max_chars: int = 2000) -> str:
+    text = (text or "").strip()
+    return text[:max_chars]
+
+
+def first_non_empty(values: List[Any], default: str = "") -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return default
+
+
+def extract_protocol_section(study: Dict[str, Any]) -> Dict[str, Any]:
+    protocol = study.get("protocolSection", {})
+    identification = protocol.get("identificationModule", {})
+    eligibility = protocol.get("eligibilityModule", {})
+    contacts = protocol.get("contactsLocationsModule", {})
+    design = protocol.get("designModule", {})
+    description = protocol.get("descriptionModule", {})
+    return {
+        "identification": identification,
+        "eligibility": eligibility,
+        "contacts": contacts,
+        "design": design,
+        "description": description,
+    }
+
+
+def format_location(location: Dict[str, Any]) -> str:
+    parts = [
+        location.get("facility"),
+        location.get("city"),
+        location.get("state"),
+        location.get("country"),
+    ]
+    cleaned = [p.strip() for p in parts if isinstance(p, str) and p.strip()]
+    return ", ".join(cleaned) if cleaned else ""
+
+
+def fetch_clinical_trials() -> List[Dict[str, Any]]:
+    print("Step 1: Searching ClinicalTrials.gov...")
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "TrialFind-MVP/0.1 (demo)",
+    }
+    response = requests.get(CLINICAL_TRIALS_URL, headers=headers, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    studies = payload.get("studies", [])
+    print(f"Step 1: received {len(studies)} raw studies from API")
+
+    normalized = []
+    for study in studies[:5]:
+        sections = extract_protocol_section(study)
+        location_list = sections["contacts"].get("locations", [])
+        first_location = location_list[0] if location_list else {}
+        phase_list = sections["design"].get("phases", [])
+
+        normalized.append(
+            {
+                "nct_id": first_non_empty(
+                    [sections["identification"].get("nctId"), study.get("nctId")]
+                ),
+                "title": first_non_empty(
+                    [sections["identification"].get("briefTitle"), study.get("briefTitle")]
+                ),
+                "eligibility_criteria": truncate_text(
+                    first_non_empty(
+                        [
+                            sections["eligibility"].get("eligibilityCriteria"),
+                            study.get("eligibilityCriteria"),
+                        ]
+                    )
+                ),
+                "location": first_non_empty(
+                    [
+                        format_location(first_location),
+                        first_location.get("city"),
+                        study.get("locationCity"),
+                    ],
+                    "Unknown",
+                ),
+                "phase": first_non_empty(phase_list, "Unknown"),
+                "summary": truncate_text(
+                    first_non_empty(
+                        [
+                            sections["description"].get("briefSummary"),
+                            study.get("briefSummary"),
+                        ]
+                    )
+                ),
+                "source": "ClinicalTrials.gov",
+            }
+        )
+    print(f"Step 1 complete: {len(normalized)} trials from ClinicalTrials.gov")
+    return normalized
+
+
+def parse_tinyfish_result(raw_result: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw_result, list):
+        return raw_result
+    if isinstance(raw_result, dict):
+        for key in ("trials", "results", "items", "data"):
+            if isinstance(raw_result.get(key), list):
+                return raw_result[key]
+        for key in ("text", "output", "content"):
+            if isinstance(raw_result.get(key), str):
+                return parse_tinyfish_result(raw_result[key])
+        if isinstance(raw_result.get("trials"), list):
+            return raw_result["trials"]
+        return [raw_result]
+    if isinstance(raw_result, str):
+        cleaned = raw_result.strip()
+        try:
+            parsed = json.loads(cleaned)
+            return parse_tinyfish_result(parsed)
+        except json.JSONDecodeError:
+            match = re.search(r"(\[.*\])", cleaned, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(1))
+                return parse_tinyfish_result(parsed)
+    return []
+
+
+def fetch_mayo_trials() -> List[Dict[str, Any]]:
+    print("Step 2: Launching Tinyfish browser agent on Mayo Clinic...")
+    api_key = os.getenv("TINYFISH_API_KEY")
+    if not api_key:
+        raise RuntimeError("TINYFISH_API_KEY is missing.")
+
+    client = TinyFish(api_key=api_key)
+    task = (
+        "Go to https://www.mayoclinic.org/clinical-trials. "
+        "Search for 'breast cancer'. "
+        "Return a JSON list of the first 3 trials with fields: "
+        "title, url, eligibility_text. "
+        "If eligibility text is not on the search page, "
+        "visit each trial URL and extract it from there."
+    )
+    run_response = client.agent.run(goal=task, url="https://www.mayoclinic.org/clinical-trials")
+    raw_results = run_response.result if getattr(run_response, "result", None) else {}
+    rows = parse_tinyfish_result(raw_results)
+
+    normalized = []
+    for row in rows[:3]:
+        if not isinstance(row, dict):
+            continue
+        title = row.get("title") or "Untitled Mayo trial"
+        url = row.get("url") or ""
+        eligibility_text = row.get("eligibility_text") or row.get("eligibility") or ""
+        normalized.append(
+            {
+                "nct_id": None,
+                "title": title.strip(),
+                "eligibility_criteria": truncate_text(str(eligibility_text)),
+                "location": "Mayo Clinic (site-dependent)",
+                "phase": "Unknown",
+                "summary": truncate_text(url or "Sourced from Mayo Clinic listings."),
+                "source": "Mayo Clinic",
+            }
+        )
+    print(f"Step 2 complete: {len(normalized)} trials from Mayo Clinic")
+    return normalized
+
+
+def extract_json_text(text: str) -> str:
+    text = text.strip()
+    if text.startswith("["):
+        return text
+    match = re.search(r"(\[.*\])", text, re.DOTALL)
+    if match:
+        return match.group(1)
+    raise ValueError("No JSON array found in Claude response.")
+
+
+def score_trials_with_featherless(trials: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    print("Step 3: Sending normalized trial data to Featherless for scoring...")
+    api_key = os.getenv("FEATHERLESS_API_KEY")
+    if not api_key:
+        raise RuntimeError("FEATHERLESS_API_KEY is missing.")
+
+    client = OpenAI(api_key=api_key, base_url=FEATHERLESS_BASE_URL)
+
+    system_prompt = (
+        "You are a clinical trial matching assistant. "
+        "Return ONLY a valid JSON array. No markdown, no commentary."
+    )
+    user_prompt = f"""
+Patient profile:
+{json.dumps(DEMO_PATIENT, indent=2)}
+
+Trials (ordered; use the same index in your output):
+{json.dumps(trials, indent=2)}
+
+For EACH trial return an object with EXACTLY these keys:
+- trial_index (integer index matching input list)
+- match_score (integer 0-100)
+- match_level (one of: high, medium, low)
+- rationale (string)
+- key_eligibility_factors (array of strings)
+- potential_exclusions (array of strings)
+- plain_english_summary (string)
+
+Return a JSON array with one object per trial. No extra keys. No markdown fences.
+"""
+
+    completion = client.chat.completions.create(
+        model=FEATHERLESS_MODEL,
+        temperature=0,
+        max_tokens=2500,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    raw_text = completion.choices[0].message.content or ""
+    json_text = extract_json_text(raw_text.strip())
+    scores = json.loads(json_text)
+    if not isinstance(scores, list):
+        raise ValueError("Featherless response is not a JSON array.")
+    print(f"Step 3 complete: Featherless scored {len(scores)} trial entries")
+    return scores
+
+
+def merge_trials_with_scores(
+    raw_trials: List[Dict[str, Any]], scores: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    by_index = {}
+    for score in scores:
+        try:
+            idx = int(score.get("trial_index"))
+        except (TypeError, ValueError):
+            continue
+        by_index[idx] = score
+
+    merged = []
+    for idx, trial in enumerate(raw_trials):
+        merged.append(
+            {
+                "trial": trial,
+                "score": by_index.get(
+                    idx,
+                    {
+                        "trial_index": idx,
+                        "match_score": None,
+                        "match_level": "low",
+                        "rationale": "No score available.",
+                        "key_eligibility_factors": [],
+                        "potential_exclusions": [],
+                        "plain_english_summary": "Scoring unavailable for this trial.",
+                    },
+                ),
+            }
+        )
+    return merged
+
+
+@app.route("/")
+def index() -> str:
+    return render_template("index.html")
+
+
+@app.route("/find-trials", methods=["GET"])
+def find_trials():
+    started = time.time()
+    errors = []
+
+    clinical_trials = []
+    mayo_trials = []
+    raw_trials = []
+    scored_trials = []
+
+    try:
+        clinical_trials = fetch_clinical_trials()
+    except Exception as exc:
+        errors.append(f"Step 1 failed: {exc}")
+        print(errors[-1])
+
+    try:
+        mayo_trials = fetch_mayo_trials()
+    except Exception as exc:
+        errors.append(f"Step 2 failed: {exc}")
+        print(errors[-1])
+
+    raw_trials = clinical_trials + mayo_trials
+
+    if raw_trials:
+        try:
+            scores = score_trials_with_featherless(raw_trials)
+            scored_trials = merge_trials_with_scores(raw_trials, scores)
+        except Exception as exc:
+            errors.append(f"Step 3 failed: {exc}")
+            print(errors[-1])
+            scored_trials = []
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    response_body = {
+        "patient_profile": DEMO_PATIENT,
+        "raw_trials": raw_trials,
+        "scored_trials": scored_trials,
+        "meta": {
+            "counts": {
+                "clinicaltrials_gov": len(clinical_trials),
+                "mayo_clinic": len(mayo_trials),
+                "total_raw": len(raw_trials),
+                "total_scored": len(scored_trials),
+            },
+            "errors": errors,
+            "elapsed_ms": elapsed_ms,
+        },
+    }
+    return jsonify(response_body)
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5050"))
+    app.run(debug=True, port=port)

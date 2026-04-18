@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TrialFind MVP</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="container">
+      <h1>TrialFind</h1>
+      <p class="subtitle">
+        Demo patient: stage 3 breast cancer, age 48, Minneapolis MN, prior chemotherapy.
+      </p>
+
+      <button id="findTrialsBtn">Find Trials</button>
+      <p id="statusText" class="status"></p>
+      <div id="errorBox" class="error hidden"></div>
+
+      <section>
+        <h2>Scored Matches</h2>
+        <div id="scoredResults" class="results"></div>
+      </section>
+
+      <section>
+        <h2>Raw Trial Data</h2>
+        <details>
+          <summary>Show raw trials</summary>
+          <div id="rawResults" class="results"></div>
+        </details>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
