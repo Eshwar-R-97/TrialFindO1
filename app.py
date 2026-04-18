@@ -132,19 +132,41 @@ def fetch_clinical_trials() -> List[Dict[str, Any]]:
     return normalized
 
 
+def _looks_like_trial_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    failure_markers = {"failed", "error"}
+    status_val = str(row.get("status") or "").strip().lower()
+    if status_val in failure_markers:
+        return False
+    if row.get("error") or row.get("reason"):
+        trial_like_keys = {"title", "url", "eligibility_text", "summary_text"}
+        if not any(k in row for k in trial_like_keys):
+            return False
+    return any(
+        (isinstance(row.get(k), str) and row.get(k).strip())
+        for k in ("title", "url", "eligibility_text", "summary_text")
+    )
+
+
 def parse_tinyfish_result(raw_result: Any) -> List[Dict[str, Any]]:
     if isinstance(raw_result, list):
-        return raw_result
+        return [r for r in raw_result if _looks_like_trial_row(r)]
     if isinstance(raw_result, dict):
-        for key in ("trials", "results", "items", "data"):
-            if isinstance(raw_result.get(key), list):
-                return raw_result[key]
+        for key in ("trials", "results", "result", "items", "data", "entries"):
+            value = raw_result.get(key)
+            if isinstance(value, list):
+                return [r for r in value if _looks_like_trial_row(r)]
+            if isinstance(value, dict):
+                nested = parse_tinyfish_result(value)
+                if nested:
+                    return nested
         for key in ("text", "output", "content"):
             if isinstance(raw_result.get(key), str):
                 return parse_tinyfish_result(raw_result[key])
-        if isinstance(raw_result.get("trials"), list):
-            return raw_result["trials"]
-        return [raw_result]
+        if _looks_like_trial_row(raw_result):
+            return [raw_result]
+        return []
     if isinstance(raw_result, str):
         cleaned = raw_result.strip()
         try:
@@ -153,46 +175,159 @@ def parse_tinyfish_result(raw_result: Any) -> List[Dict[str, Any]]:
         except json.JSONDecodeError:
             match = re.search(r"(\[.*\])", cleaned, re.DOTALL)
             if match:
-                parsed = json.loads(match.group(1))
-                return parse_tinyfish_result(parsed)
+                try:
+                    parsed = json.loads(match.group(1))
+                    return parse_tinyfish_result(parsed)
+                except json.JSONDecodeError:
+                    return []
     return []
+
+
+MAYO_SEARCH_URL = (
+    "https://www.mayo.edu/research/clinical-trials/search-results"
+    "?keyword=breast+cancer"
+    "&studySiteStatusesGrouped=Open%2FStatus+Unknown"
+)
+
+MAYO_GOAL = """
+You are on the Mayo Clinic Research clinical trials search results page for
+the keyword "breast cancer", filtered to open/recruiting studies.
+
+Do the following:
+
+1. Identify the first 3 clinical trial result entries on the page.
+   Each entry normally has a title link and short descriptive text.
+2. For each of those 3 entries, capture:
+   - title: the trial title text as shown
+   - url: the absolute URL of the trial's detail page (the href of the title link)
+   - status: the recruiting/enrolling status shown if visible, else ""
+   - location: any visible Mayo site/campus text (e.g. Rochester, Minnesota;
+     Phoenix/Scottsdale, Arizona; Jacksonville, Florida). If unclear, use "".
+3. OPEN each of those 3 trial URLs (one at a time) and from the detail page
+   extract:
+   - eligibility_text: the full text of the "Eligibility criteria" or
+     "Inclusion/Exclusion Criteria" section. If not found, use "".
+   - summary_text: the short description / purpose paragraph near the top of
+     the detail page. If not found, use "".
+
+Return ONLY a JSON array of 3 objects. Each object MUST have EXACTLY these
+keys and nothing else:
+title, url, status, location, eligibility_text, summary_text.
+
+No markdown. No prose. No code fences. Just the raw JSON array.
+If fewer than 3 trials are shown on the page, return whatever is available
+(1 or 2 items is acceptable).
+"""
 
 
 def fetch_mayo_trials() -> List[Dict[str, Any]]:
     print("Step 2: Launching Tinyfish browser agent on Mayo Clinic...")
+    print(f"Step 2: target URL => {MAYO_SEARCH_URL}")
     api_key = os.getenv("TINYFISH_API_KEY")
     if not api_key:
         raise RuntimeError("TINYFISH_API_KEY is missing.")
 
     client = TinyFish(api_key=api_key)
-    task = (
-        "Go to https://www.mayoclinic.org/clinical-trials. "
-        "Search for 'breast cancer'. "
-        "Return a JSON list of the first 3 trials with fields: "
-        "title, url, eligibility_text. "
-        "If eligibility text is not on the search page, "
-        "visit each trial URL and extract it from there."
+
+    state: Dict[str, Any] = {
+        "started_at": time.time(),
+        "last_event_at": time.time(),
+        "run_id": None,
+        "streaming_url": None,
+        "final_status": None,
+        "result_json": None,
+        "error": None,
+        "progress_count": 0,
+    }
+
+    def _elapsed() -> str:
+        return f"{int(time.time() - state['started_at']):>3}s"
+
+    def on_started(evt):
+        state["run_id"] = getattr(evt, "run_id", None)
+        state["last_event_at"] = time.time()
+        print(f"Step 2 [{_elapsed()}]: agent started run_id={state['run_id']}")
+
+    def on_streaming_url(evt):
+        state["streaming_url"] = getattr(evt, "streaming_url", None)
+        state["last_event_at"] = time.time()
+        print(f"Step 2 [{_elapsed()}]: live browser stream => {state['streaming_url']}")
+
+    def on_progress(evt):
+        state["progress_count"] += 1
+        state["last_event_at"] = time.time()
+        purpose = getattr(evt, "purpose", "") or ""
+        print(f"Step 2 [{_elapsed()}]: progress #{state['progress_count']}: {purpose}")
+
+    def on_heartbeat(evt):
+        since = int(time.time() - state["last_event_at"])
+        print(f"Step 2 [{_elapsed()}]: heartbeat (idle {since}s since last event)")
+
+    def on_complete(evt):
+        state["final_status"] = getattr(evt, "status", None)
+        state["result_json"] = getattr(evt, "result_json", None)
+        state["error"] = getattr(evt, "error", None)
+        state["last_event_at"] = time.time()
+        print(f"Step 2 [{_elapsed()}]: COMPLETE status={state['final_status']}")
+
+    stream = client.agent.stream(
+        goal=MAYO_GOAL,
+        url=MAYO_SEARCH_URL,
+        on_started=on_started,
+        on_streaming_url=on_streaming_url,
+        on_progress=on_progress,
+        on_heartbeat=on_heartbeat,
+        on_complete=on_complete,
     )
-    run_response = client.agent.run(goal=task, url="https://www.mayoclinic.org/clinical-trials")
-    raw_results = run_response.result if getattr(run_response, "result", None) else {}
+
+    for _ in stream:
+        pass
+
+    raw_results = state["result_json"] or {}
+    status = state["final_status"]
+    print(f"Step 2: final status={status}, progress_events={state['progress_count']}")
+    try:
+        preview = json.dumps(raw_results)[:500]
+    except Exception:
+        preview = str(raw_results)[:500]
+    print(f"Step 2: raw result preview => {preview}")
+
+    if state["error"]:
+        raise RuntimeError(f"Tinyfish agent error: {state['error']}")
+
+    if isinstance(raw_results, dict) and str(raw_results.get("status") or "").lower() == "failed":
+        reason = raw_results.get("reason") or raw_results.get("observation") or "unknown"
+        raise RuntimeError(f"Tinyfish agent failed: {reason}")
+
     rows = parse_tinyfish_result(raw_results)
+    print(f"Step 2: parsed {len(rows)} row(s) from agent output")
 
     normalized = []
     for row in rows[:3]:
         if not isinstance(row, dict):
             continue
-        title = row.get("title") or "Untitled Mayo trial"
-        url = row.get("url") or ""
-        eligibility_text = row.get("eligibility_text") or row.get("eligibility") or ""
+        title = (row.get("title") or "Untitled Mayo trial").strip()
+        url = (row.get("url") or "").strip()
+        eligibility_text = (
+            row.get("eligibility_text")
+            or row.get("eligibility")
+            or row.get("eligibilityCriteria")
+            or ""
+        )
+        summary_text = (
+            row.get("summary_text") or row.get("summary") or row.get("description") or ""
+        )
+        location = (row.get("location") or "Mayo Clinic (site-dependent)").strip()
         normalized.append(
             {
                 "nct_id": None,
-                "title": title.strip(),
+                "title": title,
                 "eligibility_criteria": truncate_text(str(eligibility_text)),
-                "location": "Mayo Clinic (site-dependent)",
+                "location": location,
                 "phase": "Unknown",
-                "summary": truncate_text(url or "Sourced from Mayo Clinic listings."),
+                "summary": truncate_text(summary_text or url or "Sourced from Mayo Clinic listings."),
                 "source": "Mayo Clinic",
+                "mayo_url": url,
             }
         )
     print(f"Step 2 complete: {len(normalized)} trials from Mayo Clinic")
