@@ -2,13 +2,70 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List
+from queue import Queue
+from threading import Thread
+from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template
+from flask import Flask, Response, jsonify, render_template, stream_with_context
 from openai import OpenAI
 from tinyfish import TinyFish
+
+
+class Reporter:
+    """Emits both human log lines and structured step updates to an optional queue.
+
+    Callers pass a `Reporter` into each pipeline step so they can push fine-grained
+    events (one per sub-action or retry) as they happen instead of batching at the
+    end.
+    """
+
+    def __init__(self, queue: "Optional[Queue[Optional[Dict[str, Any]]]]" = None) -> None:
+        self._queue = queue
+
+    def _emit(self, event: Dict[str, Any]) -> None:
+        event.setdefault("ts", time.time())
+        if self._queue is not None:
+            self._queue.put(event)
+
+    def log(self, message: str, step: Optional[int] = None) -> None:
+        prefix = f"[Step {step}] " if step else ""
+        print(f"{prefix}{message}", flush=True)
+        self._emit({"type": "log", "step": step, "message": message})
+
+    def step(self, step: int, status: str, summary: str = "", title: Optional[str] = None) -> None:
+        """Update one of the three step status cards.
+
+        status: "running" | "complete" | "error"
+        """
+        print(f"[Step {step}] {status.upper()}: {summary or title or ''}".rstrip(), flush=True)
+        self._emit(
+            {
+                "type": "step_update",
+                "step": step,
+                "status": status,
+                "title": title,
+                "summary": summary,
+            }
+        )
+
+    def trial(self, trial: Dict[str, Any]) -> None:
+        """Emit a single raw trial as soon as it's normalized."""
+        self._emit({"type": "trial_added", "trial": trial})
+
+    def scored(self, entry: Dict[str, Any]) -> None:
+        """Emit a single scored trial (trial + score) as soon as available."""
+        self._emit({"type": "scored_added", "entry": entry})
+
+    def result(self, payload: Dict[str, Any]) -> None:
+        self._emit({"type": "result", "payload": payload})
+
+    def done(self) -> None:
+        if self._queue is not None:
+            self._queue.put({"type": "done", "ts": time.time()})
+            self._queue.put(None)
+
 
 load_dotenv()
 
@@ -30,8 +87,42 @@ CLINICAL_TRIALS_URL = (
     "format=json"
 )
 
-FEATHERLESS_MODEL = os.getenv("FEATHERLESS_MODEL", "Qwen/Qwen2.5-72B-Instruct")
+FEATHERLESS_MODEL = os.getenv("FEATHERLESS_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
+
+
+def prewarm_featherless(reporter: "Reporter") -> None:
+    """Fire a tiny request at the Featherless model in a background thread so
+    that by the time Step 3 runs, the model is already resident on GPU and we
+    skip the 30-60s cold-start penalty.
+
+    Non-blocking; failures are logged but never propagate.
+    """
+    api_key = os.getenv("FEATHERLESS_API_KEY")
+    if not api_key:
+        return
+
+    def _run() -> None:
+        try:
+            started = time.time()
+            reporter.log(
+                f"Pre-warming {FEATHERLESS_MODEL} on Featherless in background...",
+            )
+            client = OpenAI(api_key=api_key, base_url=FEATHERLESS_BASE_URL)
+            client.chat.completions.create(
+                model=FEATHERLESS_MODEL,
+                max_tokens=1,
+                temperature=0,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            elapsed_ms = int((time.time() - started) * 1000)
+            reporter.log(
+                f"Pre-warm complete in {elapsed_ms} ms — {FEATHERLESS_MODEL} is now hot."
+            )
+        except Exception as exc:
+            reporter.log(f"Pre-warm failed (non-fatal, Step 3 will still run): {exc}")
+
+    Thread(target=_run, daemon=True).start()
 
 
 def truncate_text(text: Any, max_chars: int = 2000) -> str:
@@ -73,62 +164,98 @@ def format_location(location: Dict[str, Any]) -> str:
     return ", ".join(cleaned) if cleaned else ""
 
 
-def fetch_clinical_trials() -> List[Dict[str, Any]]:
-    print("Step 1: Searching ClinicalTrials.gov...")
+def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
+    reporter.step(1, "running", "Querying ClinicalTrials.gov API...", title="ClinicalTrials.gov API")
+    reporter.log("Searching ClinicalTrials.gov for recruiting breast cancer studies near Minneapolis MN.", step=1)
+    reporter.log(f"Request URL: {CLINICAL_TRIALS_URL}", step=1)
+
     headers = {
         "Accept": "application/json",
         "User-Agent": "TrialFind-MVP/0.1 (demo)",
     }
-    response = requests.get(CLINICAL_TRIALS_URL, headers=headers, timeout=30)
-    response.raise_for_status()
+
+    max_attempts = 3
+    last_error: Optional[Exception] = None
+    response = None
+    for attempt in range(1, max_attempts + 1):
+        reporter.log(f"HTTP GET attempt {attempt}/{max_attempts}...", step=1)
+        try:
+            response = requests.get(CLINICAL_TRIALS_URL, headers=headers, timeout=30)
+            response.raise_for_status()
+            reporter.log(f"HTTP {response.status_code} received ({len(response.content)} bytes).", step=1)
+            break
+        except Exception as exc:
+            last_error = exc
+            reporter.log(f"Attempt {attempt} failed: {exc}", step=1)
+            if attempt < max_attempts:
+                reporter.log(f"Retrying in 2s...", step=1)
+                time.sleep(2)
+            else:
+                raise
+    if response is None:
+        raise RuntimeError(f"ClinicalTrials.gov request failed: {last_error}")
+
     payload = response.json()
     studies = payload.get("studies", [])
-    print(f"Step 1: received {len(studies)} raw studies from API")
+    reporter.log(f"Parsed JSON response. {len(studies)} study record(s) returned.", step=1)
 
     normalized = []
-    for study in studies[:5]:
+    for idx, study in enumerate(studies[:5], start=1):
         sections = extract_protocol_section(study)
         location_list = sections["contacts"].get("locations", [])
         first_location = location_list[0] if location_list else {}
         phase_list = sections["design"].get("phases", [])
 
-        normalized.append(
-            {
-                "nct_id": first_non_empty(
-                    [sections["identification"].get("nctId"), study.get("nctId")]
-                ),
-                "title": first_non_empty(
-                    [sections["identification"].get("briefTitle"), study.get("briefTitle")]
-                ),
-                "eligibility_criteria": truncate_text(
-                    first_non_empty(
-                        [
-                            sections["eligibility"].get("eligibilityCriteria"),
-                            study.get("eligibilityCriteria"),
-                        ]
-                    )
-                ),
-                "location": first_non_empty(
-                    [
-                        format_location(first_location),
-                        first_location.get("city"),
-                        study.get("locationCity"),
-                    ],
-                    "Unknown",
-                ),
-                "phase": first_non_empty(phase_list, "Unknown"),
-                "summary": truncate_text(
-                    first_non_empty(
-                        [
-                            sections["description"].get("briefSummary"),
-                            study.get("briefSummary"),
-                        ]
-                    )
-                ),
-                "source": "ClinicalTrials.gov",
-            }
+        nct_id = first_non_empty(
+            [sections["identification"].get("nctId"), study.get("nctId")]
         )
-    print(f"Step 1 complete: {len(normalized)} trials from ClinicalTrials.gov")
+        title = first_non_empty(
+            [sections["identification"].get("briefTitle"), study.get("briefTitle")]
+        )
+
+        trial_record = {
+            "nct_id": nct_id,
+            "title": title,
+            "eligibility_criteria": truncate_text(
+                first_non_empty(
+                    [
+                        sections["eligibility"].get("eligibilityCriteria"),
+                        study.get("eligibilityCriteria"),
+                    ]
+                )
+            ),
+            "location": first_non_empty(
+                [
+                    format_location(first_location),
+                    first_location.get("city"),
+                    study.get("locationCity"),
+                ],
+                "Unknown",
+            ),
+            "phase": first_non_empty(phase_list, "Unknown"),
+            "summary": truncate_text(
+                first_non_empty(
+                    [
+                        sections["description"].get("briefSummary"),
+                        study.get("briefSummary"),
+                    ]
+                )
+            ),
+            "source": "ClinicalTrials.gov",
+        }
+        normalized.append(trial_record)
+        reporter.log(
+            f"Normalized trial {idx}/{min(len(studies), 5)}: {nct_id or 'NCT?'} — {title[:80] if title else 'Untitled'}",
+            step=1,
+        )
+        reporter.trial(trial_record)
+
+    reporter.step(
+        1,
+        "complete",
+        f"Got {len(normalized)} trial(s) from ClinicalTrials.gov.",
+        title="ClinicalTrials.gov API",
+    )
     return normalized
 
 
@@ -220,9 +347,14 @@ If fewer than 3 trials are shown on the page, return whatever is available
 """
 
 
-def fetch_mayo_trials() -> List[Dict[str, Any]]:
-    print("Step 2: Launching Tinyfish browser agent on Mayo Clinic...")
-    print(f"Step 2: target URL => {MAYO_SEARCH_URL}")
+def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
+    reporter.step(
+        2,
+        "running",
+        "Launching Tinyfish browser agent on Mayo Clinic...",
+        title="Mayo Clinic browser agent (Tinyfish)",
+    )
+    reporter.log(f"Target URL: {MAYO_SEARCH_URL}", step=2)
     api_key = os.getenv("TINYFISH_API_KEY")
     if not api_key:
         raise RuntimeError("TINYFISH_API_KEY is missing.")
@@ -246,29 +378,29 @@ def fetch_mayo_trials() -> List[Dict[str, Any]]:
     def on_started(evt):
         state["run_id"] = getattr(evt, "run_id", None)
         state["last_event_at"] = time.time()
-        print(f"Step 2 [{_elapsed()}]: agent started run_id={state['run_id']}")
+        reporter.log(f"Agent started (run_id={state['run_id']}, elapsed={_elapsed()}).", step=2)
 
     def on_streaming_url(evt):
         state["streaming_url"] = getattr(evt, "streaming_url", None)
         state["last_event_at"] = time.time()
-        print(f"Step 2 [{_elapsed()}]: live browser stream => {state['streaming_url']}")
+        reporter.log(f"Live browser stream available: {state['streaming_url']}", step=2)
 
     def on_progress(evt):
         state["progress_count"] += 1
         state["last_event_at"] = time.time()
-        purpose = getattr(evt, "purpose", "") or ""
-        print(f"Step 2 [{_elapsed()}]: progress #{state['progress_count']}: {purpose}")
+        purpose = (getattr(evt, "purpose", "") or "").strip()
+        reporter.log(purpose or "(agent working...)", step=2)
 
     def on_heartbeat(evt):
         since = int(time.time() - state["last_event_at"])
-        print(f"Step 2 [{_elapsed()}]: heartbeat (idle {since}s since last event)")
+        reporter.log(f"heartbeat (elapsed {_elapsed()}, idle {since}s)", step=2)
 
     def on_complete(evt):
         state["final_status"] = getattr(evt, "status", None)
         state["result_json"] = getattr(evt, "result_json", None)
         state["error"] = getattr(evt, "error", None)
         state["last_event_at"] = time.time()
-        print(f"Step 2 [{_elapsed()}]: COMPLETE status={state['final_status']}")
+        reporter.log(f"Browser agent complete: {state['final_status']}", step=2)
 
     stream = client.agent.stream(
         goal=MAYO_GOAL,
@@ -285,12 +417,15 @@ def fetch_mayo_trials() -> List[Dict[str, Any]]:
 
     raw_results = state["result_json"] or {}
     status = state["final_status"]
-    print(f"Step 2: final status={status}, progress_events={state['progress_count']}")
+    reporter.log(
+        f"Final status={status}, {state['progress_count']} progress event(s) observed.",
+        step=2,
+    )
     try:
-        preview = json.dumps(raw_results)[:500]
+        preview = json.dumps(raw_results)[:300]
     except Exception:
-        preview = str(raw_results)[:500]
-    print(f"Step 2: raw result preview => {preview}")
+        preview = str(raw_results)[:300]
+    reporter.log(f"Raw result preview: {preview}", step=2)
 
     if state["error"]:
         raise RuntimeError(f"Tinyfish agent error: {state['error']}")
@@ -300,14 +435,15 @@ def fetch_mayo_trials() -> List[Dict[str, Any]]:
         raise RuntimeError(f"Tinyfish agent failed: {reason}")
 
     rows = parse_tinyfish_result(raw_results)
-    print(f"Step 2: parsed {len(rows)} row(s) from agent output")
+    reporter.log(f"Parsed {len(rows)} trial row(s) from agent output.", step=2)
 
     normalized = []
-    for row in rows[:3]:
+    for idx, row in enumerate(rows[:3], start=1):
         if not isinstance(row, dict):
             continue
         title = (row.get("title") or "Untitled Mayo trial").strip()
         url = (row.get("url") or "").strip()
+        reporter.log(f"Normalized Mayo trial {idx}: {title[:80]}", step=2)
         eligibility_text = (
             row.get("eligibility_text")
             or row.get("eligibility")
@@ -318,19 +454,24 @@ def fetch_mayo_trials() -> List[Dict[str, Any]]:
             row.get("summary_text") or row.get("summary") or row.get("description") or ""
         )
         location = (row.get("location") or "Mayo Clinic (site-dependent)").strip()
-        normalized.append(
-            {
-                "nct_id": None,
-                "title": title,
-                "eligibility_criteria": truncate_text(str(eligibility_text)),
-                "location": location,
-                "phase": "Unknown",
-                "summary": truncate_text(summary_text or url or "Sourced from Mayo Clinic listings."),
-                "source": "Mayo Clinic",
-                "mayo_url": url,
-            }
-        )
-    print(f"Step 2 complete: {len(normalized)} trials from Mayo Clinic")
+        trial_record = {
+            "nct_id": None,
+            "title": title,
+            "eligibility_criteria": truncate_text(str(eligibility_text)),
+            "location": location,
+            "phase": "Unknown",
+            "summary": truncate_text(summary_text or url or "Sourced from Mayo Clinic listings."),
+            "source": "Mayo Clinic",
+            "mayo_url": url,
+        }
+        normalized.append(trial_record)
+        reporter.trial(trial_record)
+    reporter.step(
+        2,
+        "complete",
+        f"Got {len(normalized)} trial(s) from Mayo Clinic.",
+        title="Mayo Clinic browser agent (Tinyfish)",
+    )
     return normalized
 
 
@@ -344,8 +485,16 @@ def extract_json_text(text: str) -> str:
     raise ValueError("No JSON array found in Claude response.")
 
 
-def score_trials_with_featherless(trials: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    print("Step 3: Sending normalized trial data to Featherless for scoring...")
+def score_trials_with_featherless(
+    trials: List[Dict[str, Any]], reporter: Reporter
+) -> List[Dict[str, Any]]:
+    reporter.step(
+        3,
+        "running",
+        f"Scoring {len(trials)} trial(s) with Featherless AI...",
+        title="Featherless AI scoring",
+    )
+    reporter.log(f"Asking {FEATHERLESS_MODEL} to score {len(trials)} trial(s)...", step=3)
     api_key = os.getenv("FEATHERLESS_API_KEY")
     if not api_key:
         raise RuntimeError("FEATHERLESS_API_KEY is missing.")
@@ -353,8 +502,14 @@ def score_trials_with_featherless(trials: List[Dict[str, Any]]) -> List[Dict[str
     client = OpenAI(api_key=api_key, base_url=FEATHERLESS_BASE_URL)
 
     system_prompt = (
-        "You are a clinical trial matching assistant. "
-        "Return ONLY a valid JSON array. No markdown, no commentary."
+        "You are a clinical trial matching assistant whose audience is the "
+        "patient themselves, not a clinician. You write in warm, plain, "
+        "second-person English ('you', 'your') and gently explain any "
+        "necessary medical term the first time it appears in parentheses "
+        "(e.g., 'HER2-positive (a type of breast cancer that grows faster)'). "
+        "Keep essential clinical terms when they matter — don't oversimplify "
+        "to the point of inaccuracy. "
+        "Return ONLY a valid JSON array. No markdown, no commentary, no code fences."
     )
     user_prompt = f"""
 Patient profile:
@@ -364,33 +519,77 @@ Trials (ordered; use the same index in your output):
 {json.dumps(trials, indent=2)}
 
 For EACH trial return an object with EXACTLY these keys:
-- trial_index (integer index matching input list)
-- match_score (integer 0-100)
-- match_level (one of: high, medium, low)
-- rationale (string)
-- key_eligibility_factors (array of strings)
-- potential_exclusions (array of strings)
-- plain_english_summary (string)
+- trial_index: integer index matching the input list.
+- match_score: integer 0-100.
+- match_level: one of "high", "medium", "low".
+- rationale: 1-2 sentences, written TO the patient ("you"), explaining in
+  plain language WHY this trial might or might not be a fit based on their
+  profile. Keep key medical terms but briefly explain them. Avoid words
+  like "cohort", "adjuvant", "neoadjuvant", "ECOG", "inclusion/exclusion
+  criteria" unless you define them inline.
+- key_eligibility_factors: array of 2-4 short strings, each phrased as what
+  the patient would need to have/be (e.g., "You need to be 18 or older",
+  "You should have HER2-positive breast cancer (a specific subtype)").
+- potential_exclusions: array of short strings describing things that would
+  likely disqualify the patient, phrased plainly (e.g., "You can't join if
+  you've had brain metastases (cancer that has spread to the brain)"). Use
+  an empty array if none apply.
+- plain_english_summary: 2-4 friendly sentences for the patient explaining
+  (a) what the trial is testing and why, (b) what participating would look
+  like at a high level, and (c) what this could mean for them. Keep it
+  approachable — a patient with no medical background should understand
+  it — but don't strip out important clinical nouns; briefly define them.
+  Avoid hype or false promises.
 
 Return a JSON array with one object per trial. No extra keys. No markdown fences.
 """
 
-    completion = client.chat.completions.create(
-        model=FEATHERLESS_MODEL,
-        temperature=0,
-        max_tokens=2500,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
+    max_attempts = 3
+    last_error: Optional[Exception] = None
+    scores: List[Dict[str, Any]] = []
 
-    raw_text = completion.choices[0].message.content or ""
-    json_text = extract_json_text(raw_text.strip())
-    scores = json.loads(json_text)
-    if not isinstance(scores, list):
-        raise ValueError("Featherless response is not a JSON array.")
-    print(f"Step 3 complete: Featherless scored {len(scores)} trial entries")
+    for attempt in range(1, max_attempts + 1):
+        reporter.log(f"Scoring request attempt {attempt}/{max_attempts}...", step=3)
+        try:
+            completion = client.chat.completions.create(
+                model=FEATHERLESS_MODEL,
+                temperature=0,
+                max_tokens=2500,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            raw_text = completion.choices[0].message.content or ""
+            reporter.log(
+                f"Received {len(raw_text)} chars from Featherless. Parsing JSON...",
+                step=3,
+            )
+            json_text = extract_json_text(raw_text.strip())
+            parsed = json.loads(json_text)
+            if not isinstance(parsed, list):
+                raise ValueError("Featherless response is not a JSON array.")
+            scores = parsed
+            reporter.log(f"Parsed {len(scores)} scored trial object(s).", step=3)
+            break
+        except Exception as exc:
+            last_error = exc
+            reporter.log(f"Attempt {attempt} failed: {exc}", step=3)
+            if attempt < max_attempts:
+                reporter.log("Retrying scoring request in 2s...", step=3)
+                time.sleep(2)
+            else:
+                raise
+
+    if not scores and last_error is not None:
+        raise last_error
+
+    reporter.step(
+        3,
+        "complete",
+        f"Scored {len(scores)} trial(s).",
+        title="Featherless AI scoring",
+    )
     return scores
 
 
@@ -432,41 +631,61 @@ def index() -> str:
     return render_template("index.html")
 
 
-@app.route("/find-trials", methods=["GET"])
-def find_trials():
+def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     started = time.time()
-    errors = []
+    errors: List[str] = []
 
-    clinical_trials = []
-    mayo_trials = []
-    raw_trials = []
-    scored_trials = []
+    clinical_trials: List[Dict[str, Any]] = []
+    mayo_trials: List[Dict[str, Any]] = []
+    scored_trials: List[Dict[str, Any]] = []
+
+    reporter.step(1, "pending", "Idle.", title="ClinicalTrials.gov API")
+    reporter.step(2, "pending", "Idle.", title="Mayo Clinic browser agent (Tinyfish)")
+    reporter.step(3, "pending", "Idle.", title="Featherless AI scoring")
+    reporter.log("Pipeline started.")
+
+    prewarm_featherless(reporter)
 
     try:
-        clinical_trials = fetch_clinical_trials()
+        clinical_trials = fetch_clinical_trials(reporter)
     except Exception as exc:
-        errors.append(f"Step 1 failed: {exc}")
-        print(errors[-1])
+        msg = f"Step 1 failed: {exc}"
+        errors.append(msg)
+        reporter.log(msg, step=1)
+        reporter.step(1, "error", str(exc), title="ClinicalTrials.gov API")
 
     try:
-        mayo_trials = fetch_mayo_trials()
+        mayo_trials = fetch_mayo_trials(reporter)
     except Exception as exc:
-        errors.append(f"Step 2 failed: {exc}")
-        print(errors[-1])
+        msg = f"Step 2 failed: {exc}"
+        errors.append(msg)
+        reporter.log(msg, step=2)
+        reporter.step(2, "error", str(exc), title="Mayo Clinic browser agent (Tinyfish)")
 
     raw_trials = clinical_trials + mayo_trials
+    reporter.log(
+        f"Combined raw trials: {len(raw_trials)} "
+        f"(ClinicalTrials.gov={len(clinical_trials)}, Mayo={len(mayo_trials)})"
+    )
 
     if raw_trials:
         try:
-            scores = score_trials_with_featherless(raw_trials)
+            scores = score_trials_with_featherless(raw_trials, reporter)
             scored_trials = merge_trials_with_scores(raw_trials, scores)
+            for entry in scored_trials:
+                reporter.scored(entry)
         except Exception as exc:
-            errors.append(f"Step 3 failed: {exc}")
-            print(errors[-1])
+            msg = f"Step 3 failed: {exc}"
+            errors.append(msg)
+            reporter.log(msg, step=3)
+            reporter.step(3, "error", str(exc), title="Featherless AI scoring")
             scored_trials = []
+    else:
+        reporter.step(3, "error", "No trials to score.", title="Featherless AI scoring")
 
     elapsed_ms = int((time.time() - started) * 1000)
-    response_body = {
+    reporter.log(f"All steps finished in {elapsed_ms} ms.")
+    return {
         "patient_profile": DEMO_PATIENT,
         "raw_trials": raw_trials,
         "scored_trials": scored_trials,
@@ -481,7 +700,47 @@ def find_trials():
             "elapsed_ms": elapsed_ms,
         },
     }
-    return jsonify(response_body)
+
+
+@app.route("/find-trials", methods=["GET"])
+def find_trials():
+    result = _run_pipeline(Reporter())
+    return jsonify(result)
+
+
+@app.route("/find-trials-stream", methods=["GET"])
+def find_trials_stream():
+    queue: "Queue[Optional[Dict[str, Any]]]" = Queue()
+    reporter = Reporter(queue=queue)
+
+    def worker() -> None:
+        try:
+            result = _run_pipeline(reporter)
+            reporter.result(result)
+        except Exception as exc:
+            reporter.log(f"Pipeline crashed: {exc}")
+        finally:
+            reporter.done()
+
+    Thread(target=worker, daemon=True).start()
+
+    @stream_with_context
+    def event_stream():
+        yield f"data: {json.dumps({'type': 'log', 'message': 'Connected. Starting pipeline...', 'ts': time.time()})}\n\n"
+        while True:
+            item = queue.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+
+    return Response(
+        event_stream(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":

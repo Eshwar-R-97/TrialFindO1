@@ -17,14 +17,51 @@
       <p id="statusText" class="status"></p>
       <div id="errorBox" class="error hidden"></div>
 
-      <section>
-        <h2>Scored Matches</h2>
-        <div id="scoredResults" class="results"></div>
+      <section class="step-cards" id="stepCards">
+        <article class="step-card" data-step="1" data-status="idle">
+          <div class="step-head">
+            <span class="step-num">1</span>
+            <h3 class="step-title">ClinicalTrials.gov API</h3>
+            <span class="step-badge">IDLE</span>
+          </div>
+          <p class="step-summary">Waiting to start.</p>
+        </article>
+        <article class="step-card" data-step="2" data-status="idle">
+          <div class="step-head">
+            <span class="step-num">2</span>
+            <h3 class="step-title">Mayo Clinic browser agent (Tinyfish)</h3>
+            <span class="step-badge">IDLE</span>
+          </div>
+          <p class="step-summary">Waiting to start.</p>
+        </article>
+        <article class="step-card" data-step="3" data-status="idle">
+          <div class="step-head">
+            <span class="step-num">3</span>
+            <h3 class="step-title">Featherless AI scoring</h3>
+            <span class="step-badge">IDLE</span>
+          </div>
+          <p class="step-summary">Waiting to start.</p>
+        </article>
       </section>
 
       <section>
-        <h2>Raw Trial Data</h2>
-        <details>
+        <div class="log-header">
+          <h2>Live activity</h2>
+          <button id="clearLogsBtn" class="secondary" type="button">Clear</button>
+        </div>
+        <div id="logPanel" class="log-panel" aria-live="polite"></div>
+      </section>
+
+      <section>
+        <h2>Scored Matches <span id="scoredCount" class="count-pill hidden">0</span></h2>
+        <div id="scoredResults" class="results">
+          <p class="empty-hint">Scored matches will appear here once Step 3 finishes.</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Raw Trial Data <span id="rawCount" class="count-pill hidden">0</span></h2>
+        <details id="rawDetails">
           <summary>Show raw trials</summary>
           <div id="rawResults" class="results"></div>
         </details>
