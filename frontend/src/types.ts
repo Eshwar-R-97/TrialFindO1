@@ -1,3 +1,10 @@
+export interface Contact {
+  name: string;
+  role: string;
+  phone: string;
+  email: string;
+}
+
 export interface Trial {
   nct_id?: string | null;
   nct_url?: string;
@@ -9,6 +16,7 @@ export interface Trial {
   phase?: string;
   summary?: string;
   source: string;
+  contacts?: Contact[];
 }
 
 export interface Score {

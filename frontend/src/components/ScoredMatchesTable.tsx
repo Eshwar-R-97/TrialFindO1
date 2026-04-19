@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { ChevronRight, ExternalLink, MapPin } from "lucide-react";
 import type { ScoredEntry } from "../types";
 import { Panel } from "./PipelinePanel";
+import { ContactCell, ContactList } from "./Contacts";
 import {
   cn,
   eligibilitySnippet,
@@ -108,6 +109,14 @@ function DetailRow({ entry }: { entry: ScoredEntry }) {
         </div>
         <div>
           <p className="text-[10px] font-bold uppercase tracking-[0.07em] text-slate-500">
+            Study contacts
+          </p>
+          <div className="mt-1.5">
+            <ContactList contacts={trial.contacts} />
+          </div>
+        </div>
+        <div>
+          <p className="text-[10px] font-bold uppercase tracking-[0.07em] text-slate-500">
             Full eligibility text
           </p>
           <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
@@ -176,9 +185,10 @@ export function ScoredMatchesTable({ scored, running }: ScoredMatchesTableProps)
                     { label: "Score", cls: "w-[110px] whitespace-nowrap" },
                     { label: "Source", cls: "w-[150px] whitespace-nowrap" },
                     { label: "Title", cls: "min-w-[280px]" },
-                    { label: "One-line summary", cls: "min-w-[260px]" },
+                    { label: "One-line summary", cls: "min-w-[240px]" },
                     { label: "Location", cls: "min-w-[160px]" },
-                    { label: "Eligibility", cls: "min-w-[240px]" },
+                    { label: "Contact", cls: "min-w-[200px]" },
+                    { label: "Eligibility", cls: "min-w-[220px]" },
                   ].map((c) => (
                     <th
                       key={c.label}
@@ -247,12 +257,15 @@ export function ScoredMatchesTable({ scored, running }: ScoredMatchesTableProps)
                             <span>{trialLocationLabel(trial)}</span>
                           </span>
                         </td>
+                        <td className="px-4 py-3.5">
+                          <ContactCell contacts={trial.contacts} />
+                        </td>
                         <td className="px-4 py-3.5 text-muted-foreground">
                           {eligibility}
                         </td>
                       </motion.tr>
                       <tr>
-                        <td colSpan={6} className="p-0">
+                        <td colSpan={7} className="p-0">
                           <AnimatePresence initial={false}>
                             {isOpen && <DetailRow entry={entry} />}
                           </AnimatePresence>

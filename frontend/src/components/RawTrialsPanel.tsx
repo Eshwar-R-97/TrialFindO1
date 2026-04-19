@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { ChevronRight, ExternalLink, FlaskConical, MapPin } from "lucide-react";
 import type { Trial } from "../types";
 import { Panel } from "./PipelinePanel";
+import { ContactList } from "./Contacts";
 import {
   cn,
   firstSentence,
@@ -78,6 +79,14 @@ function RawTrialCard({ trial }: { trial: Trial }) {
                 <p className="mt-1 whitespace-pre-wrap text-foreground/90">
                   {trial.summary || "Not provided."}
                 </p>
+              </div>
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-[0.07em] text-slate-500">
+                  Study contacts
+                </p>
+                <div className="mt-1.5">
+                  <ContactList contacts={trial.contacts} />
+                </div>
               </div>
               <div>
                 <p className="text-[10px] font-bold uppercase tracking-[0.07em] text-slate-500">
