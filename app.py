@@ -440,11 +440,57 @@ def _featherless_pdf_api_key() -> str:
 
 
 # How many Mayo Clinic detail pages to scrape in parallel. We launch one
-# Tinyfish browser agent per URL. The default is 2 because Tinyfish plans
-# (observed empirically) seem to cap active browser sessions at 2 — going
-# higher just causes the 3rd agent to wait server-side for a free slot.
-# Bump this in your .env if your plan allows more simultaneous sessions.
-MAYO_MAX_CONCURRENCY = int(os.getenv("MAYO_MAX_CONCURRENCY", "2"))
+# Tinyfish browser agent per URL. Per-key concurrency observed empirically
+# is ~2 active browser sessions — going higher on a single key just causes
+# the extra agent to wait server-side for a free slot. So when multiple
+# keys are configured we default to 2 × (number of keys), which lets each
+# key saturate its own cap in parallel. Override with MAYO_MAX_CONCURRENCY.
+TINYFISH_SESSIONS_PER_KEY = int(os.getenv("TINYFISH_SESSIONS_PER_KEY", "2"))
+
+
+def _collect_tinyfish_keys() -> List[str]:
+    """Return every non-empty `TINYFISH_API_KEY*` env var, in priority order.
+
+    Supports:
+      - `TINYFISH_API_KEY` (the primary / legacy slot)
+      - `TINYFISH_API_KEY_2`, `TINYFISH_API_KEY_3`, … for additional keys
+      - any other `TINYFISH_API_KEY_<suffix>` you add later
+
+    Duplicates are removed while preserving order, so you can safely list the
+    same key twice without doubling requests against one quota.
+    """
+    keys: List[str] = []
+    seen: set[str] = set()
+    primary = (os.getenv("TINYFISH_API_KEY") or "").strip()
+    if primary:
+        keys.append(primary)
+        seen.add(primary)
+    for name, value in os.environ.items():
+        if not name.startswith("TINYFISH_API_KEY_"):
+            continue
+        v = (value or "").strip()
+        if not v or v in seen:
+            continue
+        keys.append(v)
+        seen.add(v)
+    return keys
+
+
+def _mayo_default_concurrency() -> int:
+    """Default Mayo concurrency = 2 × number of configured Tinyfish keys."""
+    n_keys = max(1, len(_collect_tinyfish_keys()))
+    return max(1, n_keys * TINYFISH_SESSIONS_PER_KEY)
+
+
+MAYO_MAX_CONCURRENCY = int(
+    os.getenv("MAYO_MAX_CONCURRENCY") or _mayo_default_concurrency()
+)
+
+# How many Mayo trials to pull details for per run. Defaults to the
+# concurrency limit (every trial scraped in a single parallel wave → same
+# wall-clock time as scraping fewer trials). Lower it if you want to keep
+# runs super fast; raise it if your plan has spare sessions to burn.
+MAYO_MAX_TRIALS = int(os.getenv("MAYO_MAX_TRIALS") or MAYO_MAX_CONCURRENCY)
 
 # NCI Clinical Trials Search (CTRP) API — a second, richer source of
 # federally-registered oncology trials. Unlike ClinicalTrials.gov this one
@@ -1220,10 +1266,10 @@ MAYO_SEARCH_GOAL_TEMPLATE = """
 You are on the Mayo Clinic Research clinical trials search results page for
 the keyword "{keyword_display}", filtered to open/recruiting studies.
 
-Identify the first 3 clinical trial result entries on the page. Each entry
-normally has a title link and short descriptive text.
+Identify the first {max_trials} clinical trial result entries on the page.
+Each entry normally has a title link and short descriptive text.
 
-For each of those 3 entries, capture:
+For each of those {max_trials} entries, capture:
 - title: the trial title text as shown.
 - url: the absolute URL of the trial's detail page (the href of the title
   link). If the href is relative, prepend "https://www.mayo.edu" so the URL
@@ -1232,12 +1278,12 @@ For each of those 3 entries, capture:
 - location: any visible Mayo site/campus text (e.g. Rochester, Minnesota;
   Phoenix/Scottsdale, Arizona; Jacksonville, Florida). If unclear, use "".
 
-Return ONLY a JSON array of up to 3 objects. Each object MUST have EXACTLY
-these keys and nothing else: title, url, status, location.
+Return ONLY a JSON array of up to {max_trials} objects. Each object MUST
+have EXACTLY these keys and nothing else: title, url, status, location.
 
 No markdown. No prose. No code fences. Just the raw JSON array. Do NOT
-open the detail pages — another agent will handle that. If fewer than 3
-trials are shown, return whatever is available.
+open the detail pages — another agent will handle that. If fewer than
+{max_trials} trials are shown, return whatever is available.
 """
 
 
@@ -1521,9 +1567,10 @@ def _fetch_mayo_search_list(
     search_url: str,
     search_goal: str,
 ) -> List[Dict[str, Any]]:
-    """Phase A: one agent, returns a list of up to 3 {title,url,status,location}."""
+    """Phase A: one agent, returns a list of up to MAYO_MAX_TRIALS entries."""
     reporter.log(
-        "Phase A: listing top 3 results from Mayo search page (single agent).",
+        f"Phase A: listing top {MAYO_MAX_TRIALS} results from Mayo "
+        f"search page (single agent).",
         step=3,
     )
     raw = _run_tinyfish_agent(
@@ -1561,7 +1608,7 @@ def _fetch_mayo_search_list(
     reporter.log(
         f"Phase A done: {len(usable)} trial URL(s) to fan out on.", step=3
     )
-    return usable[:3]
+    return usable[:MAYO_MAX_TRIALS]
 
 
 def fetch_mayo_trials(
@@ -1569,9 +1616,11 @@ def fetch_mayo_trials(
 ) -> List[Dict[str, Any]]:
     """Scrape Mayo Clinic trials using two phases:
 
-    Phase A — one agent that lists up to 3 trial URLs from the search page.
-    Phase B — one agent per URL, running in parallel, each extracting
-              eligibility / summary / contacts from a single detail page.
+    Phase A — one agent that lists up to MAYO_MAX_TRIALS URLs from the
+              search page.
+    Phase B — one agent per URL, running in parallel across every configured
+              Tinyfish API key (round-robin), each extracting eligibility /
+              summary / contacts from a single detail page.
 
     Wall-clock time is roughly:  phaseA + max(detail_latency)
     instead of:                  phaseA + sum(detail_latency).
@@ -1585,14 +1634,22 @@ def fetch_mayo_trials(
     cond = search_condition_phrase(patient)
     keyword_variants = _mayo_keyword_variants(cond)
 
-    api_key = os.getenv("TINYFISH_API_KEY")
-    if not api_key:
+    api_keys = _collect_tinyfish_keys()
+    if not api_keys:
         raise RuntimeError("TINYFISH_API_KEY is missing.")
 
-    # Per the SDK (httpx-based), a single TinyFish client is safe to share
-    # across threads — each client.agent.stream(...) call opens its own
-    # server-side browser session.
-    client = TinyFish(api_key=api_key)
+    # One TinyFish client per API key. Each client gets its own quota /
+    # concurrency cap server-side, so distributing detail agents across
+    # clients is what actually unlocks real parallelism (as opposed to
+    # just bumping max_workers on a single key, which queues server-side).
+    clients = [TinyFish(api_key=k) for k in api_keys]
+    # For single-shot Phase A we just use the first key; no point fanning.
+    client = clients[0]
+    reporter.log(
+        f"Tinyfish: {len(clients)} API key(s) configured — "
+        f"detail agents will round-robin across them.",
+        step=3,
+    )
 
     # ── Phase A: get the list of URLs (retry with simpler keywords if empty) ──
     search_entries: List[Dict[str, Any]] = []
@@ -1600,7 +1657,8 @@ def fetch_mayo_trials(
         kw_url = quote_plus(kw)
         may_url = _mayo_search_url(kw_url)
         may_goal = MAYO_SEARCH_GOAL_TEMPLATE.format(
-            keyword_display=kw.replace('"', "'")
+            keyword_display=kw.replace('"', "'"),
+            max_trials=MAYO_MAX_TRIALS,
         )
         reporter.milestone(
             f"Mayo Clinic search (try {attempt}/{len(keyword_variants)}): “{kw[:80]}”.",
@@ -1652,14 +1710,19 @@ def fetch_mayo_trials(
     t0 = time.time()
 
     def _run_detail(idx: int, entry: Dict[str, Any]) -> Dict[str, Any]:
-        tag = f"detail-{idx + 1}"
+        # Round-robin: trial idx 0 → key 0, idx 1 → key 1, … This spreads
+        # concurrent browser sessions across every configured Tinyfish key
+        # so each key stays under its per-account session cap.
+        worker_client = clients[idx % len(clients)]
+        key_label = f"key{(idx % len(clients)) + 1}"
+        tag = f"detail-{idx + 1}-{key_label}"
         start = time.time()
         goal = MAYO_DETAIL_GOAL_TEMPLATE.format(
             detail_url=entry["url"], title=entry["title"][:120]
         )
         try:
             raw = _run_tinyfish_agent(
-                client,
+                worker_client,
                 goal=goal,
                 url=entry["url"],
                 reporter=reporter,
@@ -2562,7 +2625,7 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         reporter.step(3, "error", str(exc), title="Mayo Clinic browser agent (Tinyfish)")
 
     if (
-        os.getenv("TINYFISH_API_KEY")
+        _collect_tinyfish_keys()
         and len(mayo_trials) == 0
         and not any(str(e).startswith("Step 3 failed") for e in errors)
     ):
