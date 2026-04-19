@@ -102,26 +102,26 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
   const profile = result?.extracted_profile;
 
   return (
-    <section className="rounded-2xl border border-border bg-card p-6 shadow-soft sm:p-7">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+    <section className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm sm:p-8">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-400">
-            Document
+          <p className="mb-1.5 text-[11px] font-bold uppercase tracking-[0.1em] text-brand-500">
+            Step 1 — Upload your records
           </p>
-          <h2 className="text-xl font-semibold tracking-tight sm:text-2xl">
+          <h2 className="text-xl font-bold tracking-tight text-gray-900 sm:text-2xl">
             Upload a pathology or visit-summary PDF
           </h2>
-          <p className="mt-1.5 max-w-prose text-sm text-muted-foreground">
-            pypdf turns the file into page-level JSON on the server;{" "}
-            <span className="font-medium text-foreground">Featherless AI</span> parses
-            that JSON into a patient profile for trial matching — not a diagnosis.
+          <p className="mt-2 max-w-prose text-sm text-gray-500">
+            Your document is read securely on our server.{" "}
+            <span className="font-semibold text-gray-700">Featherless AI</span> extracts
+            your medical profile for trial matching — never for diagnosis.
           </p>
         </div>
-        <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl border border-border bg-slate-50 px-4 py-2.5 text-sm font-medium text-slate-800 shadow-sm transition hover:bg-slate-100">
+        <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-gray-200 bg-white px-5 py-2.5 text-sm font-semibold text-gray-700 shadow-sm transition hover:border-brand-300 hover:bg-brand-50 hover:text-brand-700">
           {loading ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <Loader2 className="h-4 w-4 animate-spin text-brand-500" />
           ) : (
-            <FileText className="h-4 w-4 text-slate-500" />
+            <FileText className="h-4 w-4 text-gray-400" />
           )}
           <span>{loading ? "Reading…" : "Choose PDF"}</span>
           <input
@@ -139,7 +139,7 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
       </div>
 
       {error && (
-        <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-3.5 py-3 text-sm text-red-800">
+        <div className="mt-4 rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
           {error}
         </div>
       )}

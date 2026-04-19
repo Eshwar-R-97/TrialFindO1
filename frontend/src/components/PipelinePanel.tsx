@@ -12,25 +12,25 @@ const STATUS_LABEL: Record<StepState["status"], string> = {
 };
 
 const STATUS_BADGE: Record<StepState["status"], string> = {
-  idle: "bg-slate-100 text-slate-500 ring-slate-200",
-  pending: "bg-slate-100 text-slate-500 ring-slate-200",
-  running: "bg-blue-100 text-blue-700 ring-blue-200",
+  idle: "bg-gray-100 text-gray-500 ring-gray-200",
+  pending: "bg-gray-100 text-gray-500 ring-gray-200",
+  running: "bg-brand-100 text-brand-700 ring-brand-200",
   complete: "bg-emerald-100 text-emerald-700 ring-emerald-200",
   error: "bg-red-100 text-red-700 ring-red-200",
 };
 
 const CARD_CLASSES: Record<StepState["status"], string> = {
-  idle: "bg-slate-50/60 border-border",
-  pending: "bg-slate-50/60 border-border",
-  running: "bg-blue-50/70 border-blue-200 shadow-[0_0_0_3px_rgba(37,99,235,0.06)]",
+  idle: "bg-gray-50/60 border-gray-100",
+  pending: "bg-gray-50/60 border-gray-100",
+  running: "bg-brand-50/70 border-brand-200 shadow-[0_0_0_3px_rgba(29,158,117,0.06)]",
   complete: "bg-emerald-50/60 border-emerald-200",
   error: "bg-red-50/70 border-red-200",
 };
 
 const NUM_CLASSES: Record<StepState["status"], string> = {
-  idle: "bg-slate-400",
-  pending: "bg-slate-400",
-  running: "bg-blue-600",
+  idle: "bg-gray-300",
+  pending: "bg-gray-300",
+  running: "bg-brand-500",
   complete: "bg-emerald-600",
   error: "bg-red-600",
 };
@@ -63,7 +63,7 @@ export function StepCard({ state, index }: { state: StepState; index: number }) 
         >
           {state.step}
         </div>
-        <h4 className="flex-1 text-[15px] font-semibold leading-tight tracking-tight text-foreground">
+        <h4 className="flex-1 text-[15px] font-semibold leading-tight tracking-tight text-gray-900">
           {state.title}
         </h4>
         <span
@@ -76,7 +76,7 @@ export function StepCard({ state, index }: { state: StepState; index: number }) 
           {STATUS_LABEL[state.status]}
         </span>
       </div>
-      <p className="mt-2 pl-11 text-sm text-muted-foreground">{state.summary}</p>
+      <p className="mt-2 pl-11 text-sm text-gray-500">{state.summary}</p>
     </motion.article>
   );
 }
@@ -108,18 +108,18 @@ export function Panel({
   countBadge?: number;
 }) {
   return (
-    <section className="rounded-2xl border border-border bg-card p-5 shadow-soft sm:p-6">
-      <header className="mb-4 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2">
-          <h3 className="text-base font-semibold tracking-tight">{title}</h3>
+    <section className="rounded-2xl border border-gray-100 bg-white p-5 shadow-sm sm:p-6">
+      <header className="mb-5 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2.5">
+          <h3 className="text-base font-bold tracking-tight text-gray-900">{title}</h3>
           {countBadge !== undefined && countBadge > 0 && (
-            <span className="inline-flex h-5 items-center justify-center rounded-full bg-brand-700 px-2 text-[11px] font-bold text-white">
+            <span className="inline-flex h-5 items-center justify-center rounded-full bg-brand-500 px-2 text-[11px] font-bold text-white">
               {countBadge}
             </span>
           )}
         </div>
         {subtitle && !action && (
-          <p className="text-xs text-muted-foreground sm:text-right">{subtitle}</p>
+          <p className="text-xs text-gray-400 sm:text-right">{subtitle}</p>
         )}
         {action && <div className="flex items-center gap-2">{action}</div>}
       </header>

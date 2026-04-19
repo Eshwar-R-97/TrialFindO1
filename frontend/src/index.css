@@ -3,14 +3,14 @@
 @tailwind utilities;
 
 :root {
-  --background: 210 20% 98%;
-  --foreground: 222 47% 11%;
+  --background: 0 0% 100%;
+  --foreground: 222 47% 8%;
   --card: 0 0% 100%;
-  --card-alt: 210 20% 98%;
-  --border: 214 32% 91%;
-  --muted: 210 20% 96%;
-  --muted-foreground: 215 16% 47%;
-  --primary: 173 80% 26%;
+  --card-alt: 150 30% 98%;
+  --border: 220 13% 91%;
+  --muted: 150 20% 97%;
+  --muted-foreground: 220 9% 46%;
+  --primary: 160 69% 37%;
   --primary-foreground: 0 0% 100%;
 }
 
@@ -26,10 +26,7 @@ body {
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  background:
-    radial-gradient(1100px 580px at -10% -10%, rgba(20, 184, 166, 0.08), transparent 60%),
-    radial-gradient(900px 500px at 110% -20%, rgba(37, 99, 235, 0.06), transparent 55%),
-    hsl(var(--background));
+  background: #ffffff;
   color: hsl(var(--foreground));
 }
 

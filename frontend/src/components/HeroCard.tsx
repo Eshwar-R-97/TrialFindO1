@@ -6,7 +6,6 @@ interface HeroCardProps {
   errors: string[];
   elapsedMs: number | null;
   running: boolean;
-  /** When set (after PDF upload), chips reflect parsed data instead of the hard-coded demo. */
   patientProfile?: PatientProfileExtracted | null;
 }
 
@@ -40,55 +39,57 @@ export function HeroCard({
   patientProfile,
 }: HeroCardProps) {
   const chips = patientProfile ? chipsFromProfile(patientProfile) : DEMO_CHIPS;
+
   return (
-    <section className="rounded-2xl border border-border bg-card p-6 shadow-soft sm:p-7">
+    <section className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm sm:p-8">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-400">
-            {patientProfile ? "Active patient (from PDF)" : "Demo patient"}
+          <p className="mb-1.5 text-[11px] font-bold uppercase tracking-[0.1em] text-brand-500">
+            {patientProfile ? "Active patient · from PDF" : "Demo patient"}
           </p>
-          <h2 className="text-xl font-semibold tracking-tight sm:text-2xl">
+          <h3 className="text-xl font-bold tracking-tight text-gray-900 sm:text-2xl">
             Matching recruiting trials to this profile
-          </h2>
-          <p className="mt-1.5 max-w-prose text-sm text-muted-foreground">
+          </h3>
+          <p className="mt-2 max-w-prose text-sm text-gray-500">
             Every step streams live — watch the pipeline collect, normalize, and score
             matching trials in real time.
           </p>
         </div>
-        <div className="shrink-0 sm:text-right">
-          <div className="inline-flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-sm">
+
+        <div className="shrink-0">
+          <div className="inline-flex items-center gap-2 rounded-xl border border-gray-100 bg-gray-50 px-4 py-2.5 text-sm">
             <span
               className={`h-2 w-2 rounded-full ${
-                running ? "bg-blue-500 animate-pulse" : "bg-slate-400"
+                running ? "animate-pulse bg-brand-500" : "bg-gray-300"
               }`}
             />
-            <span className="font-medium text-slate-700">{statusText}</span>
+            <span className="font-medium text-gray-700">{statusText}</span>
           </div>
           {elapsedMs !== null && !running && (
-            <p className="mt-1 text-xs text-muted-foreground">
-              Total elapsed {(elapsedMs / 1000).toFixed(1)}s
+            <p className="mt-1.5 text-right text-xs text-gray-400">
+              Completed in {(elapsedMs / 1000).toFixed(1)}s
             </p>
           )}
         </div>
       </div>
 
-      <div className="mt-5 flex flex-wrap gap-2">
+      <div className="mt-6 flex flex-wrap gap-2.5">
         {chips.map((chip) => (
           <div
             key={chip.label}
-            className="flex flex-col rounded-xl border border-border/70 bg-slate-50/70 px-3.5 py-2"
+            className="flex flex-col rounded-xl border border-gray-100 bg-gray-50 px-4 py-2.5"
           >
-            <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">
+            <span className="text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
               {chip.label}
             </span>
-            <span className="text-sm font-medium text-foreground">{chip.value}</span>
+            <span className="mt-0.5 text-sm font-semibold text-gray-900">{chip.value}</span>
           </div>
         ))}
       </div>
 
       {errors.length > 0 && (
-        <div className="mt-5 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 p-3.5 text-sm text-red-800">
-          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+        <div className="mt-5 flex items-start gap-3 rounded-xl border border-red-100 bg-red-50 p-4 text-sm text-red-800">
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
           <div>
             <p className="font-semibold">Partial failures</p>
             <ul className="mt-1 list-disc space-y-0.5 pl-4 text-red-700">
