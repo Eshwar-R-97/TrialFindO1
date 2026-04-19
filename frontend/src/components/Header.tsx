@@ -46,10 +46,8 @@ export function Header({ running, onRun, hasProfile }: HeaderProps) {
       animate={{ y: 0, opacity: 1 }}
       transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
       className={cn(
-        "sticky top-0 z-40 transition-all duration-300",
-        scrolled
-          ? "border-b border-white/10 bg-surface-950/92 backdrop-blur-xl"
-          : "bg-surface-950/60 backdrop-blur-md"
+        "sticky top-0 z-40 bg-black transition-all duration-300",
+        scrolled && "border-b border-white/10 shadow-lg shadow-black/40"
       )}
     >
       <div className="mx-auto flex h-16 max-w-[1280px] items-center justify-between gap-4 px-6 lg:px-8">
