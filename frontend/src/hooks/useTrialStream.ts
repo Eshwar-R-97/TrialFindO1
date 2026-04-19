@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  FriendlyStatus,
   LogLine,
   PipelineResult,
   SSEEvent,
@@ -31,6 +32,10 @@ export interface TrialStream {
   running: boolean;
   steps: StepState[];
   logs: LogLine[];
+  // Latest patient-friendly status line (rewritten by Featherless). Null
+  // until the first `friendly_status` event arrives — the StatusTicker
+  // falls back to `logs` in that case.
+  friendlyStatus: FriendlyStatus | null;
   rawTrials: Trial[];
   scored: ScoredEntry[];
   elapsedMs: number | null;
@@ -44,6 +49,9 @@ export function useTrialStream(): TrialStream {
   const [running, setRunning] = useState(false);
   const [steps, setSteps] = useState<StepState[]>(INITIAL_STEPS);
   const [logs, setLogs] = useState<LogLine[]>([]);
+  const [friendlyStatus, setFriendlyStatus] = useState<FriendlyStatus | null>(
+    null
+  );
   const [rawTrials, setRawTrials] = useState<Trial[]>([]);
   const [scored, setScored] = useState<ScoredEntry[]>([]);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
@@ -54,6 +62,7 @@ export function useTrialStream(): TrialStream {
 
   const sourceRef = useRef<EventSource | null>(null);
   const logIdRef = useRef(0);
+  const friendlyIdRef = useRef(0);
   const finalPayloadRef = useRef<PipelineResult | null>(null);
 
   const clearLogs = useCallback(() => setLogs([]), []);
@@ -64,6 +73,7 @@ export function useTrialStream(): TrialStream {
     setRunning(true);
     setSteps(INITIAL_STEPS);
     setLogs([]);
+    setFriendlyStatus(null);
     setRawTrials([]);
     setScored([]);
     setElapsedMs(null);
@@ -123,6 +133,18 @@ export function useTrialStream(): TrialStream {
           );
           break;
         }
+        case "friendly_status": {
+          // Replace-in-place: the ticker only ever shows the latest friendly
+          // status, and the id bump lets framer-motion animate the swap.
+          setFriendlyStatus({
+            id: ++friendlyIdRef.current,
+            step: data.step,
+            message: data.message,
+            ts: data.ts,
+            kind: logKind(data.message, data.step),
+          });
+          break;
+        }
         case "result": {
           finalPayloadRef.current = data.payload;
           setElapsedMs(data.payload.meta?.elapsed_ms ?? null);
@@ -164,6 +186,7 @@ export function useTrialStream(): TrialStream {
     running,
     steps,
     logs,
+    friendlyStatus,
     rawTrials,
     scored,
     elapsedMs,

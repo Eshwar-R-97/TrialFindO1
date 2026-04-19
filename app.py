@@ -25,6 +25,10 @@ class Reporter:
 
     def __init__(self, queue: "Optional[Queue[Optional[Dict[str, Any]]]]" = None) -> None:
         self._queue = queue
+        # Optional async LLM translator that rewrites technical pipeline log
+        # lines into patient-friendly one-liners. Set by `_run_pipeline` once
+        # the Featherless key is confirmed available. `None` means no-op.
+        self.translator: "Optional[FriendlyTranslator]" = None
 
     def _emit(self, event: Dict[str, Any]) -> None:
         event.setdefault("ts", time.time())
@@ -35,6 +39,30 @@ class Reporter:
         prefix = f"[Step {step}] " if step else ""
         print(f"{prefix}{message}", flush=True)
         self._emit({"type": "log", "step": step, "message": message})
+
+    def friendly(self, message: str, step: Optional[int] = None) -> None:
+        """Emit a patient-friendly one-line status update to the UI.
+
+        These are rendered in the live status ticker and are meant to be read
+        by the patient in plain language. Backend stdout also gets a copy so
+        the friendly summary shows up in server logs.
+        """
+        prefix = f"[Friendly Step {step}] " if step else "[Friendly] "
+        print(f"{prefix}{message}", flush=True)
+        self._emit({"type": "friendly_status", "step": step, "message": message})
+
+    def translate(self, raw_message: str, step: Optional[int] = None) -> None:
+        """Ask the attached LLM translator (if any) to rewrite `raw_message`
+        as a patient-friendly one-liner and emit a `friendly_status` event
+        when it finishes. Fire-and-forget; no-op when no translator is set."""
+        if self.translator is not None:
+            self.translator.translate(raw_message, step)
+
+    def milestone(self, message: str, step: Optional[int] = None) -> None:
+        """Log a patient-relevant milestone: write it to the raw log stream
+        AND hand it to the LLM translator to produce a friendly one-liner."""
+        self.log(message, step=step)
+        self.translate(message, step=step)
 
     def step(self, step: int, status: str, summary: str = "", title: Optional[str] = None) -> None:
         """Update one of the three step status cards.
@@ -150,6 +178,89 @@ def prewarm_featherless(reporter: "Reporter") -> None:
             reporter.log(f"Pre-warm failed (non-fatal, Step 4 will still run): {exc}")
 
     Thread(target=_run, daemon=True).start()
+
+
+class FriendlyTranslator:
+    """Rewrites technical pipeline log lines into patient-friendly one-liners
+    using the small Featherless model, in the background.
+
+    Design notes:
+    - Single worker thread so we never burn more than one concurrent slot on
+      the Featherless plan (scoring in Step 4 can already use up to
+      FEATHERLESS_MAX_CONCURRENCY). Translations silently swallow 429s and
+      any other errors so the raw log stream keeps flowing uninterrupted.
+    - Results stream back to the UI as `friendly_status` SSE events via the
+      given Reporter the moment each one lands.
+    - Messages are capped to ~160 chars because they render on a single line
+      in the status ticker.
+    """
+
+    SYSTEM_PROMPT = (
+        "You help a breast cancer patient follow along as their clinical "
+        "trial search runs live on screen. Rewrite the technical pipeline "
+        "status below as ONE short, calm, friendly sentence (max 14 words) "
+        "that a non-technical patient can understand. Use plain everyday "
+        "language. You may keep simple medical terms (e.g. chemotherapy, "
+        "HER2, metastatic). Do NOT include IDs, URLs, error codes, raw "
+        "numbers from URLs, or jargon like HTTP, JSON, API, payload, "
+        "request, retry, or attempt. Never quote the original text. Return "
+        "only the rewritten sentence with no prefix, label, or quotes."
+    )
+
+    def __init__(self, api_key: str, model: str, reporter: "Reporter") -> None:
+        self._model = model
+        self._reporter = reporter
+        self._client = OpenAI(api_key=api_key, base_url=FEATHERLESS_BASE_URL)
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="friendly"
+        )
+
+    def translate(self, raw_message: str, step: Optional[int] = None) -> None:
+        """Fire and forget: rewrite `raw_message` and emit `friendly_status`."""
+        if not raw_message or not raw_message.strip():
+            return
+        try:
+            self._executor.submit(self._translate_and_emit, raw_message, step)
+        except RuntimeError:
+            # Executor already shut down — drop silently.
+            pass
+
+    def _translate_and_emit(
+        self, raw_message: str, step: Optional[int]
+    ) -> None:
+        try:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": raw_message[:500]},
+                ],
+                max_tokens=40,
+                temperature=0.3,
+                timeout=15,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            # Some instruct models love to wrap output in quotes or prepend
+            # "Here is ..." — strip both so the ticker stays clean.
+            text = text.strip('"').strip("'").strip()
+            if text.lower().startswith(("here is", "here's", "sure")):
+                after = text.split(":", 1)
+                if len(after) == 2:
+                    text = after[1].strip().strip('"').strip("'").strip()
+            if not text:
+                return
+            text = text.splitlines()[0].strip()
+            if len(text) > 160:
+                text = text[:157].rstrip() + "..."
+            self._reporter.friendly(text, step=step)
+        except Exception:
+            # Silent: if the translator can't keep up (429, timeout, etc.)
+            # the raw log line is still visible on the backend and the UI
+            # falls back gracefully to the last good friendly status.
+            pass
+
+    def shutdown(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def truncate_text(text: Any, max_chars: int = 2000) -> str:
@@ -270,7 +381,10 @@ def extract_ctgov_contacts(
 
 def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     reporter.step(1, "running", "Querying ClinicalTrials.gov API...", title="ClinicalTrials.gov API")
-    reporter.log("Searching ClinicalTrials.gov for recruiting breast cancer studies near Minneapolis MN.", step=1)
+    reporter.milestone(
+        "Searching ClinicalTrials.gov for recruiting breast cancer studies near Minneapolis MN.",
+        step=1,
+    )
     reporter.log(f"Request URL: {CLINICAL_TRIALS_URL}", step=1)
 
     headers = {
@@ -370,6 +484,11 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
             f"{title[:80] if title else 'Untitled'} — {location_display} — {contact_summary}",
             step=1,
         )
+        reporter.translate(
+            f"Adding ClinicalTrials.gov trial to your list: "
+            f"{title[:140] if title else 'Untitled'} (location: {location_display}).",
+            step=1,
+        )
         reporter.trial(trial_record)
 
     reporter.step(
@@ -377,6 +496,10 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         "complete",
         f"Got {len(normalized)} trial(s) from ClinicalTrials.gov.",
         title="ClinicalTrials.gov API",
+    )
+    reporter.translate(
+        f"Finished ClinicalTrials.gov — found {len(normalized)} trial(s) near you.",
+        step=1,
     )
     return normalized
 
@@ -513,8 +636,8 @@ def fetch_nci_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         "sites.recruitment_status": "ACTIVE",
         "size": NCI_MAX_RESULTS,
     }
-    reporter.log(
-        "Searching NCI CTRP for active breast cancer trials recruiting in Minnesota.",
+    reporter.milestone(
+        "Searching NCI Cancer.gov for active breast cancer trials recruiting in Minnesota.",
         step=2,
     )
     reporter.log(f"Request: GET {NCI_API_URL} (filters: MN, Active, breast cancer)", step=2)
@@ -610,7 +733,17 @@ def fetch_nci_trials(reporter: Reporter) -> List[Dict[str, Any]]:
             f"{nct_id or nci_id or 'NCI?'} — {title[:80]} — {location_display} — {contact_summary}",
             step=2,
         )
+        reporter.translate(
+            f"Adding NCI Cancer.gov trial to your list: "
+            f"{title[:140] if title else 'Untitled'} (location: {location_display}).",
+            step=2,
+        )
         reporter.trial(trial_record)
+
+    reporter.translate(
+        f"Finished NCI Cancer.gov — found {len(normalized)} trial(s) in Minnesota.",
+        step=2,
+    )
 
     reporter.step(
         2,
@@ -971,6 +1104,10 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         "Launching Tinyfish browser agent on Mayo Clinic (Phase A)...",
         title="Mayo Clinic browser agent (Tinyfish)",
     )
+    reporter.milestone(
+        "Opening the Mayo Clinic website to look for breast cancer trials.",
+        step=3,
+    )
     reporter.log(f"Target URL: {MAYO_SEARCH_URL}", step=3)
 
     api_key = os.getenv("TINYFISH_API_KEY")
@@ -1062,6 +1199,11 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
                 f"Phase B: {completed}/{len(search_entries)} detail page(s) scraped…",
                 title="Mayo Clinic browser agent (Tinyfish)",
             )
+            reporter.translate(
+                f"Read Mayo Clinic trial details: "
+                f"{trial_record.get('title', 'Untitled')[:140]}.",
+                step=3,
+            )
 
     total_ms = int((time.time() - t0) * 1000)
     reporter.log(
@@ -1081,6 +1223,10 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         "complete",
         f"Got {len(normalized)} trial(s) from Mayo Clinic.",
         title="Mayo Clinic browser agent (Tinyfish)",
+    )
+    reporter.translate(
+        f"Finished Mayo Clinic — collected {len(normalized)} trial(s).",
+        step=3,
     )
     return normalized
 
@@ -1271,6 +1417,10 @@ def score_trials_with_featherless(
         f"Scoring {len(trials)} trial(s) with Featherless AI in parallel...",
         title="Featherless AI scoring",
     )
+    reporter.translate(
+        f"Our AI is now reviewing all {len(trials)} trials to see which ones fit you best.",
+        step=4,
+    )
 
     if not trials:
         reporter.step(
@@ -1318,6 +1468,12 @@ def score_trials_with_featherless(
             f"in {elapsed_ms} ms.",
             step=4,
         )
+        trial_title = (trial.get("title") or "Untitled")[:120]
+        level = score.get("match_level") or "unknown"
+        reporter.translate(
+            f"Finished reviewing '{trial_title}' — rated a {level} match for you.",
+            step=4,
+        )
         return score
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -1355,6 +1511,10 @@ def score_trials_with_featherless(
         "complete",
         f"Scored {len(trials)} trial(s) in parallel.",
         title="Featherless AI scoring",
+    )
+    reporter.translate(
+        f"AI finished reviewing all {len(trials)} trial(s) — your matches are ranked.",
+        step=4,
     )
 
     # Return in input-order so merge_trials_with_scores (and anything
@@ -1471,7 +1631,22 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     reporter.step(2, "pending", "Idle.", title="NCI Cancer.gov API")
     reporter.step(3, "pending", "Idle.", title="Mayo Clinic browser agent (Tinyfish)")
     reporter.step(4, "pending", "Idle.", title="Featherless AI scoring")
-    reporter.log("Pipeline started.")
+
+    # Spin up the patient-friendly translator for this pipeline run. We hand
+    # it to the reporter so any `reporter.milestone(...)` calls downstream
+    # automatically fan out a technical log AND a friendly one-liner.
+    featherless_key = os.getenv("FEATHERLESS_API_KEY")
+    translator: Optional[FriendlyTranslator] = None
+    if featherless_key:
+        translator = FriendlyTranslator(
+            featherless_key, FEATHERLESS_MODEL, reporter
+        )
+        reporter.translator = translator
+
+    reporter.milestone(
+        "Starting your clinical trial search across ClinicalTrials.gov, "
+        "NCI Cancer.gov, and Mayo Clinic."
+    )
 
     prewarm_featherless(reporter)
 
@@ -1501,10 +1676,9 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
 
     combined = clinical_trials + nci_trials + mayo_trials
     raw_trials = _dedupe_trials_by_nct_id(combined, reporter)
-    reporter.log(
-        f"Combined raw trials: {len(raw_trials)} unique "
-        f"(ClinicalTrials.gov={len(clinical_trials)}, NCI={len(nci_trials)}, "
-        f"Mayo={len(mayo_trials)})"
+    reporter.milestone(
+        f"Gathered {len(raw_trials)} unique trial(s) across all three sources — "
+        f"getting ready to check which fit you best."
     )
 
     if raw_trials:
@@ -1524,7 +1698,18 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         reporter.step(4, "error", "No trials to score.", title="Featherless AI scoring")
 
     elapsed_ms = int((time.time() - started) * 1000)
-    reporter.log(f"All steps finished in {elapsed_ms} ms.")
+    reporter.milestone(
+        f"All done in {elapsed_ms / 1000:.1f}s — "
+        f"{len(scored_trials)} scored match(es) ready for you to review."
+    )
+
+    # Drain the translator's queue politely. We don't block the response on
+    # any in-flight rewrites; the pipeline result is already complete and
+    # the UI can stop listening the moment `done` fires.
+    if translator is not None:
+        translator.shutdown()
+        reporter.translator = None
+
     return {
         "patient_profile": DEMO_PATIENT,
         "raw_trials": raw_trials,

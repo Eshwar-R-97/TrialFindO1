@@ -23,7 +23,11 @@ export default function App() {
 
         <PipelinePanel steps={stream.steps} />
 
-        <StatusTicker logs={stream.logs} running={stream.running} />
+        <StatusTicker
+          logs={stream.logs}
+          friendlyStatus={stream.friendlyStatus}
+          running={stream.running}
+        />
 
         <ScoredMatchesTable scored={stream.scored} running={stream.running} />
 

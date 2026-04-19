@@ -81,6 +81,26 @@ export interface ScoredAddedEvent {
   ts: number;
 }
 
+// A patient-friendly one-liner produced by the Featherless translator. These
+// replace the raw technical log line in the live status ticker so patients
+// see plain-language updates ("We're now looking at Mayo Clinic…") instead
+// of jargon ("[Step 3] HTTP GET attempt 1/3…").
+export interface FriendlyStatusEvent {
+  type: "friendly_status";
+  step: number | null;
+  message: string;
+  ts: number;
+}
+
+// In-memory shape tracked in useTrialStream for the latest friendly update.
+export interface FriendlyStatus {
+  id: number;
+  step: number | null;
+  message: string;
+  ts: number;
+  kind: LogKind;
+}
+
 export interface PipelineResult {
   patient_profile: Record<string, unknown>;
   raw_trials: Trial[];
@@ -107,5 +127,6 @@ export type SSEEvent =
   | StepUpdateEvent
   | TrialAddedEvent
   | ScoredAddedEvent
+  | FriendlyStatusEvent
   | ResultEvent
   | DoneEvent;
