@@ -1,26 +1,51 @@
 import { AlertCircle } from "lucide-react";
+import type { PatientProfileExtracted } from "../types";
 
 interface HeroCardProps {
   statusText: string;
   errors: string[];
   elapsedMs: number | null;
   running: boolean;
+  /** When set (after PDF upload), chips reflect parsed data instead of the hard-coded demo. */
+  patientProfile?: PatientProfileExtracted | null;
 }
 
-const PATIENT_CHIPS = [
+const DEMO_CHIPS = [
   { label: "Diagnosis", value: "Stage 3 breast cancer" },
   { label: "Age", value: "48" },
   { label: "Location", value: "Minneapolis, MN" },
   { label: "Prior treatment", value: "Chemotherapy" },
 ];
 
-export function HeroCard({ statusText, errors, elapsedMs, running }: HeroCardProps) {
+function chipsFromProfile(p: PatientProfileExtracted) {
+  const name = [p.first_name, p.last_name].filter(Boolean).join(" ").trim();
+  const priors = Array.isArray(p.prior_treatments)
+    ? p.prior_treatments.join(", ")
+    : "—";
+  return [
+    { label: "Name", value: name || "—" },
+    { label: "Diagnosis", value: p.diagnosis || "—" },
+    { label: "Cancer / stage", value: [p.cancer_type, p.stage].filter(Boolean).join(" · ") || "—" },
+    { label: "Age", value: p.age != null ? String(p.age) : "—" },
+    { label: "Location", value: p.zip_code ? `ZIP ${p.zip_code}` : "—" },
+    { label: "Prior treatment", value: priors },
+  ];
+}
+
+export function HeroCard({
+  statusText,
+  errors,
+  elapsedMs,
+  running,
+  patientProfile,
+}: HeroCardProps) {
+  const chips = patientProfile ? chipsFromProfile(patientProfile) : DEMO_CHIPS;
   return (
     <section className="rounded-2xl border border-border bg-card p-6 shadow-soft sm:p-7">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-400">
-            Demo patient
+            {patientProfile ? "Active patient (from PDF)" : "Demo patient"}
           </p>
           <h2 className="text-xl font-semibold tracking-tight sm:text-2xl">
             Matching recruiting trials to this profile
@@ -48,7 +73,7 @@ export function HeroCard({ statusText, errors, elapsedMs, running }: HeroCardPro
       </div>
 
       <div className="mt-5 flex flex-wrap gap-2">
-        {PATIENT_CHIPS.map((chip) => (
+        {chips.map((chip) => (
           <div
             key={chip.label}
             className="flex flex-col rounded-xl border border-border/70 bg-slate-50/70 px-3.5 py-2"

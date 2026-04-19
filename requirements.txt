@@ -4,3 +4,4 @@ openai
 tinyfish
 python-dotenv
 supabase
+pypdf

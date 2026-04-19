@@ -1,8 +1,10 @@
+import io
 import json
 import os
 import random
 import re
 import time
+from urllib.parse import quote_plus, urlencode
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from queue import Queue
 from threading import Lock, Thread
@@ -10,7 +12,15 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, abort, jsonify, send_from_directory, stream_with_context
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    request,
+    send_from_directory,
+    stream_with_context,
+)
 from openai import OpenAI
 from tinyfish import TinyFish
 
@@ -121,21 +131,276 @@ load_dotenv()
 _REACT_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
 app = Flask(__name__, static_folder=None)
 
+
+@app.after_request
+def _cors_localhost_dev(resp: Response) -> Response:
+    """Allow the Vite dev UI (another origin/port) to call Flask when using VITE_API_BASE_URL."""
+    path = request.path or ""
+    if not (
+        path.startswith("/api/")
+        or path.startswith("/read-pdf")
+        or path.startswith("/patient-profile")
+        or path.startswith("/find-trials")
+    ):
+        return resp
+    origin = request.headers.get("Origin")
+    if origin and (
+        origin.startswith("http://localhost:")
+        or origin.startswith("http://127.0.0.1:")
+    ):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, HEAD"
+        resp.headers["Access-Control-Allow-Headers"] = (
+            "Content-Type, Authorization, X-Requested-With"
+        )
+        resp.headers["Access-Control-Max-Age"] = "3600"
+    return resp
+
+
 DEMO_PATIENT = {
     "diagnosis": "stage 3 breast cancer",
+    "cancer_type": "breast",
     "age": 48,
     "location": "Minneapolis MN",
     "prior_treatments": "chemotherapy",
 }
 
-CLINICAL_TRIALS_URL = (
-    "https://clinicaltrials.gov/api/v2/studies?"
-    "query.cond=breast+cancer&"
-    "filter.geo=distance(44.9778,-93.2650,100mi)&"
-    "filter.overallStatus=RECRUITING&"
-    "pageSize=5&"
-    "format=json"
+# Set by a successful POST /read-pdf; `_run_pipeline` / Featherless scoring use this
+# instead of DEMO_PATIENT until the process restarts.
+_active_pdf_patient: Optional[Dict[str, Any]] = None
+
+
+def _set_active_pdf_patient(extracted_profile: Dict[str, Any]) -> None:
+    global _active_pdf_patient
+    _active_pdf_patient = extracted_profile
+
+
+def get_patient_for_pipeline() -> Dict[str, Any]:
+    """Patient dict for trial scoring and the final API payload.
+
+    After a PDF upload, mirrors Featherless fields while keeping DEMO_PATIENT
+    fallbacks for anything missing.
+    """
+    if _active_pdf_patient is None:
+        return dict(DEMO_PATIENT)
+    ext = _active_pdf_patient
+    priors = ext.get("prior_treatments")
+    if isinstance(priors, list):
+        prior_str = ", ".join(str(p) for p in priors if p)
+    else:
+        prior_str = str(priors or "").strip()
+    if not prior_str:
+        prior_str = str(DEMO_PATIENT["prior_treatments"])
+    age = ext.get("age")
+    if age is None:
+        age = DEMO_PATIENT["age"]
+    zip_c = (ext.get("zip_code") or "").strip()
+    location = f"ZIP {zip_c}" if zip_c else str(DEMO_PATIENT["location"])
+    diagnosis = (ext.get("diagnosis") or "").strip() or str(DEMO_PATIENT["diagnosis"])
+    out: Dict[str, Any] = {
+        "diagnosis": diagnosis,
+        "age": age,
+        "location": location,
+        "prior_treatments": prior_str,
+    }
+    if zip_c:
+        out["zip_code"] = zip_c
+    for key in (
+        "cancer_type",
+        "stage",
+        "summary",
+        "first_name",
+        "last_name",
+        "email",
+        "performance_status",
+    ):
+        v = ext.get(key)
+        if v is not None and v != "":
+            out[key] = v
+    bio = ext.get("biomarkers")
+    if isinstance(bio, dict) and bio:
+        out["biomarkers"] = bio
+    com = ext.get("comorbidities")
+    if isinstance(com, list) and com:
+        out["comorbidities"] = com
+    return out
+
+
+def missing_patient_input_ids(ext: Optional[Dict[str, Any]]) -> List[str]:
+    """Which inputs the UI should still collect after PDF parse (location, condition, age)."""
+    if not ext:
+        return []
+    need: List[str] = []
+    z = re.sub(r"\D", "", str(ext.get("zip_code") or ""))
+    if len(z) < 5:
+        need.append("zip_code")
+    has_dx = (ext.get("diagnosis") or "").strip()
+    has_ct = (ext.get("cancer_type") or "").strip()
+    if not has_dx and not has_ct:
+        need.append("condition")
+    if ext.get("age") is None:
+        need.append("age")
+    return need
+
+
+_PATIENT_MERGE_KEYS = frozenset(
+    {
+        "zip_code",
+        "age",
+        "diagnosis",
+        "cancer_type",
+        "stage",
+        "first_name",
+        "last_name",
+        "email",
+        "performance_status",
+        "summary",
+        "prior_treatments",
+    }
 )
+
+
+def merge_patient_profile_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply user edits onto `_active_pdf_patient`. Returns the merged extraction dict."""
+    global _active_pdf_patient
+    if _active_pdf_patient is None:
+        raise RuntimeError("No PDF profile is loaded")
+    for key, val in updates.items():
+        if key not in _PATIENT_MERGE_KEYS:
+            continue
+        if val is None:
+            continue
+        if key == "prior_treatments":
+            if isinstance(val, list):
+                _active_pdf_patient["prior_treatments"] = [
+                    str(x).strip() for x in val if str(x).strip()
+                ]
+            elif isinstance(val, str) and val.strip():
+                _active_pdf_patient["prior_treatments"] = [
+                    p.strip() for p in val.split(",") if p.strip()
+                ]
+            continue
+        if key == "age":
+            try:
+                _active_pdf_patient["age"] = int(val)
+            except (TypeError, ValueError):
+                pass
+            continue
+        if key == "zip_code":
+            digits = re.sub(r"\D", "", str(val))[:5]
+            if len(digits) == 5:
+                _active_pdf_patient["zip_code"] = digits
+            continue
+        if isinstance(val, str):
+            _active_pdf_patient[key] = val.strip()
+        else:
+            _active_pdf_patient[key] = val
+    return _active_pdf_patient
+
+
+# US state abbrev → uppercase full name (for matching NCI / site strings).
+_US_STATE_LONG: Dict[str, str] = {
+    "MN": "MINNESOTA",
+    "TX": "TEXAS",
+    "CA": "CALIFORNIA",
+    "NY": "NEW YORK",
+    "FL": "FLORIDA",
+    "IL": "ILLINOIS",
+    "PA": "PENNSYLVANIA",
+    "OH": "OHIO",
+    "GA": "GEORGIA",
+    "NC": "NORTH CAROLINA",
+    "MI": "MICHIGAN",
+    "NJ": "NEW JERSEY",
+    "WA": "WASHINGTON",
+    "AZ": "ARIZONA",
+    "MA": "MASSACHUSETTS",
+    "CO": "COLORADO",
+    "TN": "TENNESSEE",
+    "IN": "INDIANA",
+    "MO": "MISSOURI",
+    "MD": "MARYLAND",
+    "WI": "WISCONSIN",
+    "LA": "LOUISIANA",
+}
+
+
+def _expand_state_set(abbrev: str) -> set:
+    a = (abbrev or "MN").strip().upper()
+    s = {a}
+    if len(a) == 2 and a in _US_STATE_LONG:
+        s.add(_US_STATE_LONG[a])
+    return s
+
+
+def _lookup_zip_metadata(us_zip: Optional[str]) -> Dict[str, Any]:
+    """Lat/lon + state abbreviation from a 5-digit US ZIP (zippopotam.us)."""
+    digits = re.sub(r"\D", "", us_zip or "")[:5]
+    if len(digits) != 5:
+        return {}
+    try:
+        r = requests.get(f"https://api.zippopotam.us/us/{digits}", timeout=8)
+        if not r.ok:
+            return {}
+        places = r.json().get("places") or []
+        if not places:
+            return {}
+        p = places[0]
+        lat = p.get("latitude")
+        lng = p.get("longitude")
+        st = (p.get("state abbreviation") or "").strip().upper()
+        out: Dict[str, Any] = {"state": st}
+        try:
+            if lat is not None and lng is not None:
+                out["lat"] = float(lat)
+                out["lon"] = float(lng)
+        except (TypeError, ValueError):
+            pass
+        return out
+    except Exception:
+        return {}
+
+
+def _patient_zip_string(patient: Dict[str, Any]) -> str:
+    z = patient.get("zip_code")
+    if isinstance(z, str) and z.strip():
+        return z.strip()
+    loc = (patient.get("location") or "").strip()
+    if loc.upper().startswith("ZIP "):
+        return loc[4:].strip()
+    return ""
+
+
+def search_condition_phrase(patient: Dict[str, Any]) -> str:
+    """Free-text condition for ClinicalTrials.gov / NCI / Mayo keyword search."""
+    ct = (patient.get("cancer_type") or "").strip()
+    if ct:
+        low = ct.lower()
+        if "cancer" in low or "carcinoma" in low or "lymphoma" in low or "melanoma" in low:
+            return ct
+        return f"{ct} cancer"
+    diag = (patient.get("diagnosis") or "").strip()
+    if diag:
+        return diag[:240]
+    return "breast cancer"
+
+
+def clinical_trials_gov_studies_url(patient: Dict[str, Any]) -> str:
+    """ClinicalTrials.gov v2 studies URL from patient (condition + ~100mi geo)."""
+    cond = search_condition_phrase(patient)
+    lat, lon = 44.9778, -93.2650  # demo: Minneapolis
+    zm = _lookup_zip_metadata(_patient_zip_string(patient))
+    if zm.get("lat") is not None and zm.get("lon") is not None:
+        lat, lon = zm["lat"], zm["lon"]
+    params = {
+        "query.cond": cond,
+        "filter.geo": f"distance({lat},{lon},100mi)",
+        "filter.overallStatus": "RECRUITING",
+        "pageSize": "5",
+        "format": "json",
+    }
+    return "https://clinicaltrials.gov/api/v2/studies?" + urlencode(params)
+
 
 FEATHERLESS_MODEL = os.getenv("FEATHERLESS_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct")
 FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
@@ -144,6 +409,26 @@ FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 # worker pool to this value so we don't get 429s. Override via env var if
 # your plan allows more.
 FEATHERLESS_MAX_CONCURRENCY = int(os.getenv("FEATHERLESS_MAX_CONCURRENCY", "4"))
+# Set to 0/false/no to skip the extra Featherless calls that rewrite log lines
+# into patient-friendly one-liners — slightly faster and fewer 429s on small plans.
+FEATHERLESS_FRIENDLY_STATUS = os.getenv("FEATHERLESS_FRIENDLY_STATUS", "1")
+# PDF profile extraction can use a smaller/faster model than trial scoring.
+# Defaults to FEATHERLESS_MODEL when unset.
+# Example: same 8B instruct or a lighter endpoint your plan exposes.
+FEATHERLESS_PDF_MODEL = os.getenv("FEATHERLESS_PDF_MODEL", "").strip() or None
+# Completion budget for the structured patient JSON (smaller = faster generation).
+FEATHERLESS_PDF_MAX_TOKENS = int(os.getenv("FEATHERLESS_PDF_MAX_TOKENS", "900"))
+# Per-request timeout for Featherless HTTP calls (seconds).
+FEATHERLESS_HTTP_TIMEOUT = float(os.getenv("FEATHERLESS_HTTP_TIMEOUT", "120"))
+
+
+def _featherless_pdf_api_key() -> str:
+    """Key for PDF → patient profile calls. Use a dedicated key if set, else main key."""
+    pdf = (os.getenv("FEATHERLESS_PDF_API_KEY") or "").strip()
+    if pdf:
+        return pdf
+    return (os.getenv("FEATHERLESS_API_KEY") or "").strip()
+
 
 # How many Mayo Clinic detail pages to scrape in parallel. We launch one
 # Tinyfish browser agent per URL. The default is 2 because Tinyfish plans
@@ -211,7 +496,7 @@ class FriendlyTranslator:
     """
 
     SYSTEM_PROMPT = (
-        "You help a breast cancer patient follow along as their clinical "
+        "You help a cancer patient follow along as their clinical "
         "trial search runs live on screen. Rewrite the technical pipeline "
         "status below as ONE short, calm, friendly sentence (max 14 words) "
         "that a non-technical patient can understand. Use plain everyday "
@@ -317,24 +602,22 @@ def format_location(location: Dict[str, Any]) -> str:
     return ", ".join(cleaned) if cleaned else ""
 
 
-# Patient's preferred state/region — used to pick the most relevant trial site
-# out of the (often many) sites a ClinicalTrials.gov study has.
-PATIENT_PREFERRED_STATES = {"MINNESOTA", "MN"}
-
-
-def pick_best_location(locations: List[Dict[str, Any]]) -> Dict[str, Any]:
+def pick_best_location(
+    locations: List[Dict[str, Any]], preferred_state: str = "MN"
+) -> Dict[str, Any]:
     """Return the most patient-relevant location from a study's site list.
 
     Preference order:
-    1. A site in the patient's preferred state.
+    1. A site in the patient's preferred state (2-letter or full name).
     2. The first site that has at least a city + state.
     3. Whatever the first entry is.
     """
+    preferred = _expand_state_set(preferred_state)
     if not locations:
         return {}
     for loc in locations:
         state = (loc.get("state") or "").strip().upper()
-        if state in PATIENT_PREFERRED_STATES:
+        if state in preferred:
             return loc
     for loc in locations:
         if (loc.get("city") or "").strip() and (loc.get("state") or "").strip():
@@ -394,13 +677,24 @@ def extract_ctgov_contacts(
     return out
 
 
-def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
+def fetch_clinical_trials(
+    reporter: Reporter, patient: Dict[str, Any]
+) -> List[Dict[str, Any]]:
     reporter.step(1, "running", "Querying ClinicalTrials.gov API...", title="ClinicalTrials.gov API")
+    cond = search_condition_phrase(patient)
+    zm = _lookup_zip_metadata(_patient_zip_string(patient))
+    pref_state = zm.get("state") or "MN"
+    geo_note = (
+        f"near {_patient_zip_string(patient) or 'default Minneapolis area'}"
+        if zm.get("lat")
+        else "near Minneapolis MN (default geo — add ZIP in PDF for local matches)"
+    )
     reporter.milestone(
-        "Searching ClinicalTrials.gov for recruiting breast cancer studies near Minneapolis MN.",
+        f"Searching ClinicalTrials.gov for recruiting trials matching “{cond}” ({geo_note}).",
         step=1,
     )
-    reporter.log(f"Request URL: {CLINICAL_TRIALS_URL}", step=1)
+    ct_url = clinical_trials_gov_studies_url(patient)
+    reporter.log(f"Request URL: {ct_url}", step=1)
 
     headers = {
         "Accept": "application/json",
@@ -413,7 +707,7 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     for attempt in range(1, max_attempts + 1):
         reporter.log(f"HTTP GET attempt {attempt}/{max_attempts}...", step=1)
         try:
-            response = requests.get(CLINICAL_TRIALS_URL, headers=headers, timeout=30)
+            response = requests.get(ct_url, headers=headers, timeout=30)
             response.raise_for_status()
             reporter.log(f"HTTP {response.status_code} received ({len(response.content)} bytes).", step=1)
             break
@@ -436,7 +730,7 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     for idx, study in enumerate(studies[:5], start=1):
         sections = extract_protocol_section(study)
         location_list = sections["contacts"].get("locations", []) or []
-        best_location = pick_best_location(location_list)
+        best_location = pick_best_location(location_list, pref_state)
         phase_list = sections["design"].get("phases", [])
 
         nct_id = first_non_empty(
@@ -519,7 +813,9 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _pick_best_nci_site(sites: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _pick_best_nci_site(
+    sites: List[Dict[str, Any]], preferred_state: str = "MN"
+) -> Dict[str, Any]:
     """Pick the most patient-relevant NCI site.
 
     Preference: actively recruiting site in the patient's state, else any
@@ -528,10 +824,11 @@ def _pick_best_nci_site(sites: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     if not sites:
         return {}
+    preferred = _expand_state_set(preferred_state)
     in_state = [
-        s for s in sites
-        if (s.get("org_state_or_province") or "").strip().upper()
-        in PATIENT_PREFERRED_STATES
+        s
+        for s in sites
+        if (s.get("org_state_or_province") or "").strip().upper() in preferred
     ]
     for s in in_state:
         if (s.get("recruitment_status") or "").upper() == "ACTIVE":
@@ -632,8 +929,10 @@ def _summarize_nci_eligibility(elig: Dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def fetch_nci_trials(reporter: Reporter) -> List[Dict[str, Any]]:
-    """Pull breast-cancer trials with MN sites from the NCI CTRP API."""
+def fetch_nci_trials(
+    reporter: Reporter, patient: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Pull oncology trials from the NCI CTRP API for the patient's condition + state."""
     reporter.step(2, "running", "Querying NCI Cancer.gov API...", title="NCI Cancer.gov API")
 
     api_key = os.getenv("NCI_API_KEY")
@@ -644,18 +943,24 @@ def fetch_nci_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         )
         return []
 
+    cond = search_condition_phrase(patient)
+    zm = _lookup_zip_metadata(_patient_zip_string(patient))
+    nci_state = (zm.get("state") or "MN").strip().upper()[:2]
     params = {
         "current_trial_status": "Active",
-        "keyword": "breast cancer",
-        "sites.org_state_or_province": "MN",
+        "keyword": cond,
+        "sites.org_state_or_province": nci_state,
         "sites.recruitment_status": "ACTIVE",
         "size": NCI_MAX_RESULTS,
     }
     reporter.milestone(
-        "Searching NCI Cancer.gov for active breast cancer trials recruiting in Minnesota.",
+        f"Searching NCI Cancer.gov for active trials matching “{cond}” in {nci_state}.",
         step=2,
     )
-    reporter.log(f"Request: GET {NCI_API_URL} (filters: MN, Active, breast cancer)", step=2)
+    reporter.log(
+        f"Request: GET {NCI_API_URL} (filters: {nci_state}, Active, keyword={cond[:80]})",
+        step=2,
+    )
 
     headers = {
         "x-api-key": api_key,
@@ -698,7 +1003,7 @@ def fetch_nci_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     normalized: List[Dict[str, Any]] = []
     for idx, trial in enumerate(trials[:NCI_MAX_RESULTS], start=1):
         sites = trial.get("sites") or []
-        best_site = _pick_best_nci_site(sites)
+        best_site = _pick_best_nci_site(sites, nci_state)
         location_str = first_non_empty(
             [_format_nci_location(best_site), best_site.get("org_city")],
             "Location not listed",
@@ -756,7 +1061,7 @@ def fetch_nci_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         reporter.trial(trial_record)
 
     reporter.translate(
-        f"Finished NCI Cancer.gov — found {len(normalized)} trial(s) in Minnesota.",
+        f"Finished NCI Cancer.gov — found {len(normalized)} trial(s) in {nci_state}.",
         step=2,
     )
 
@@ -807,31 +1112,19 @@ def parse_tinyfish_result(raw_result: Any) -> List[Dict[str, Any]]:
     if isinstance(raw_result, str):
         cleaned = raw_result.strip()
         try:
-            parsed = json.loads(cleaned)
+            parsed = _json_decode_first_value(cleaned)
             return parse_tinyfish_result(parsed)
-        except json.JSONDecodeError:
-            match = re.search(r"(\[.*\])", cleaned, re.DOTALL)
-            if match:
-                try:
-                    parsed = json.loads(match.group(1))
-                    return parse_tinyfish_result(parsed)
-                except json.JSONDecodeError:
-                    return []
+        except ValueError:
+            return []
     return []
 
 
-MAYO_SEARCH_URL = (
-    "https://www.mayo.edu/research/clinical-trials/search-results"
-    "?keyword=breast+cancer"
-    "&studySiteStatusesGrouped=Open%2FStatus+Unknown"
-)
-
 # Phase A: just pull the list of trial URLs from the search-results page.
 # This is fast because it only loads one page and does no per-trial
-# navigation.
-MAYO_SEARCH_GOAL = """
+# navigation. Keyword comes from `search_condition_phrase(patient)` at runtime.
+MAYO_SEARCH_GOAL_TEMPLATE = """
 You are on the Mayo Clinic Research clinical trials search results page for
-the keyword "breast cancer", filtered to open/recruiting studies.
+the keyword "{keyword_display}", filtered to open/recruiting studies.
 
 Identify the first 3 clinical trial result entries on the page. Each entry
 normally has a title link and short descriptive text.
@@ -852,6 +1145,14 @@ No markdown. No prose. No code fences. Just the raw JSON array. Do NOT
 open the detail pages — another agent will handle that. If fewer than 3
 trials are shown, return whatever is available.
 """
+
+
+def _mayo_search_url(keyword_url_encoded: str) -> str:
+    return (
+        "https://www.mayo.edu/research/clinical-trials/search-results"
+        f"?keyword={keyword_url_encoded}"
+        "&studySiteStatusesGrouped=Open%2FStatus+Unknown"
+    )
 
 
 # Phase B: for ONE detail URL, extract the heavy fields. A separate Tinyfish
@@ -1000,16 +1301,9 @@ def _parse_mayo_detail_blob(raw: Any) -> Dict[str, Any]:
     """Turn a detail agent's raw result into a plain dict with our fields."""
     if isinstance(raw, str):
         try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                try:
-                    raw = json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    return {}
-            else:
-                return {}
+            raw = _json_decode_first_value(raw)
+        except ValueError:
+            return {}
     if isinstance(raw, list):
         # Some SDK paths wrap a single object in a single-element array.
         raw = raw[0] if raw else {}
@@ -1070,8 +1364,67 @@ def _build_mayo_trial_record(
     }
 
 
+def _fix_mayo_trial_url(url: str) -> str:
+    """Mayo agents sometimes return relative hrefs; detail fetch needs an absolute URL."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return "https://www.mayo.edu" + u
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    if "mayo.edu" in u:
+        return "https://" + u.lstrip("/")
+    return u
+
+
+def _mayo_keyword_variants(primary_cond: str) -> List[str]:
+    """Try the full condition first, then a shorter cancer phrase, then a broad fallback."""
+    seen: set = set()
+    out: List[str] = []
+
+    def add(label: str) -> None:
+        s = (label or "").strip()
+        if len(s) < 2:
+            return
+        key = s.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(s)
+
+    add(primary_cond)
+    low = primary_cond.lower()
+    for word in (
+        "lung",
+        "breast",
+        "colon",
+        "colorectal",
+        "prostate",
+        "ovarian",
+        "pancreatic",
+        "melanoma",
+        "lymphoma",
+        "leukemia",
+        "kidney",
+        "bladder",
+        "liver",
+        "sarcoma",
+    ):
+        if word in low:
+            add(f"{word} cancer")
+            break
+    add("cancer")
+    return out[:5]
+
+
 def _fetch_mayo_search_list(
-    client: "TinyFish", reporter: Reporter
+    client: "TinyFish",
+    reporter: Reporter,
+    search_url: str,
+    search_goal: str,
 ) -> List[Dict[str, Any]]:
     """Phase A: one agent, returns a list of up to 3 {title,url,status,location}."""
     reporter.log(
@@ -1080,30 +1433,45 @@ def _fetch_mayo_search_list(
     )
     raw = _run_tinyfish_agent(
         client,
-        goal=MAYO_SEARCH_GOAL,
-        url=MAYO_SEARCH_URL,
+        goal=search_goal,
+        url=search_url,
         reporter=reporter,
         tag="search",
     )
     rows = parse_tinyfish_result(raw)
+    reporter.log(
+        f"Phase A: Tinyfish returned {len(rows)} row(s) after parsing (before URL filter).",
+        step=3,
+    )
     # Keep only entries that have a usable url to fan out on.
-    usable = [
-        {
-            "title": (r.get("title") or "").strip() or "Untitled Mayo trial",
-            "url": (r.get("url") or "").strip(),
-            "status": (r.get("status") or "").strip(),
-            "location": (r.get("location") or "").strip(),
-        }
-        for r in rows
-        if isinstance(r, dict) and (r.get("url") or "").strip()
-    ]
+    usable: List[Dict[str, Any]] = []
+    seen_urls: set = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        fixed = _fix_mayo_trial_url((r.get("url") or "").strip())
+        if not fixed:
+            continue
+        if fixed in seen_urls:
+            continue
+        seen_urls.add(fixed)
+        usable.append(
+            {
+                "title": (r.get("title") or "").strip() or "Untitled Mayo trial",
+                "url": fixed,
+                "status": (r.get("status") or "").strip(),
+                "location": (r.get("location") or "").strip(),
+            }
+        )
     reporter.log(
         f"Phase A done: {len(usable)} trial URL(s) to fan out on.", step=3
     )
     return usable[:3]
 
 
-def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
+def fetch_mayo_trials(
+    reporter: Reporter, patient: Dict[str, Any]
+) -> List[Dict[str, Any]]:
     """Scrape Mayo Clinic trials using two phases:
 
     Phase A — one agent that lists up to 3 trial URLs from the search page.
@@ -1119,11 +1487,8 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         "Launching Tinyfish browser agent on Mayo Clinic (Phase A)...",
         title="Mayo Clinic browser agent (Tinyfish)",
     )
-    reporter.milestone(
-        "Opening the Mayo Clinic website to look for breast cancer trials.",
-        step=3,
-    )
-    reporter.log(f"Target URL: {MAYO_SEARCH_URL}", step=3)
+    cond = search_condition_phrase(patient)
+    keyword_variants = _mayo_keyword_variants(cond)
 
     api_key = os.getenv("TINYFISH_API_KEY")
     if not api_key:
@@ -1134,13 +1499,40 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     # server-side browser session.
     client = TinyFish(api_key=api_key)
 
-    # ── Phase A: get the list of URLs ──────────────────────────────────
-    search_entries = _fetch_mayo_search_list(client, reporter)
+    # ── Phase A: get the list of URLs (retry with simpler keywords if empty) ──
+    search_entries: List[Dict[str, Any]] = []
+    for attempt, kw in enumerate(keyword_variants, start=1):
+        kw_url = quote_plus(kw)
+        may_url = _mayo_search_url(kw_url)
+        may_goal = MAYO_SEARCH_GOAL_TEMPLATE.format(
+            keyword_display=kw.replace('"', "'")
+        )
+        reporter.milestone(
+            f"Mayo Clinic search (try {attempt}/{len(keyword_variants)}): “{kw[:80]}”.",
+            step=3,
+        )
+        reporter.log(f"Mayo Phase A target URL: {may_url}", step=3)
+        search_entries = _fetch_mayo_search_list(
+            client, reporter, may_url, may_goal
+        )
+        if search_entries:
+            break
+        reporter.log(
+            f"Mayo Phase A: no usable links for keyword {kw[:80]!r} — trying next variant.",
+            step=3,
+        )
+
     if not search_entries:
+        reporter.log(
+            "Mayo Phase A exhausted all keyword variants with 0 trial links. "
+            "Common causes: Tinyfish could not parse the search page JSON, "
+            "Mayo changed their layout, or the browser session timed out.",
+            step=3,
+        )
         reporter.step(
             3,
             "complete",
-            "Got 0 trial(s) from Mayo Clinic.",
+            "Got 0 trial(s) from Mayo Clinic (search returned no links).",
             title="Mayo Clinic browser agent (Tinyfish)",
         )
         return []
@@ -1269,7 +1661,9 @@ SCORING_SYSTEM_PROMPT = (
 )
 
 
-def _build_scoring_user_prompt(trial: Dict[str, Any], trial_index: int) -> str:
+def _build_scoring_user_prompt(
+    trial: Dict[str, Any], trial_index: int, patient_profile: Dict[str, Any]
+) -> str:
     """User prompt for scoring exactly ONE trial.
 
     The model returns a single JSON object (not an array), which keeps
@@ -1277,7 +1671,7 @@ def _build_scoring_user_prompt(trial: Dict[str, Any], trial_index: int) -> str:
     """
     return f"""
 Patient profile:
-{json.dumps(DEMO_PATIENT, indent=2)}
+{json.dumps(patient_profile, indent=2)}
 
 Trial to evaluate (trial_index = {trial_index}):
 {json.dumps(trial, indent=2)}
@@ -1306,18 +1700,227 @@ Return ONE JSON object. No extra keys. No markdown fences.
 """
 
 
+def _strip_markdown_json_fence(text: str) -> str:
+    """Remove ``` / ```json wrappers if the model wrapped JSON in a fence."""
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    lines = t.splitlines()
+    if not lines:
+        return t
+    # Drop opening ``` or ```json
+    body: List[str] = []
+    for line in lines[1:]:
+        if line.strip().startswith("```"):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _json_decode_first_value(text: str) -> Any:
+    """Decode the first JSON value in `text`, ignoring trailing prose (fixes 'Extra data')."""
+    t = _strip_markdown_json_fence(text)
+    if not t:
+        raise ValueError("Empty model response.")
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(t):
+        if ch not in "{[":
+            continue
+        try:
+            val, _end = decoder.raw_decode(t, i)
+            return val
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("No JSON value found in model response.")
+
+
 def _extract_json_object(text: str) -> Dict[str, Any]:
     """Pull the first well-formed JSON object out of a model response."""
-    text = text.strip()
-    if text.startswith("{"):
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        return json.loads(match.group(0))
-    raise ValueError("No JSON object found in Featherless response.")
+    val = _json_decode_first_value(text)
+    if isinstance(val, list) and len(val) == 1 and isinstance(val[0], dict):
+        val = val[0]
+    if not isinstance(val, dict):
+        raise ValueError("Model response JSON was not an object.")
+    return val
+
+
+# --- PDF upload → pypdf JSON → Featherless patient profile (pathology / AVS) ---
+
+MAX_UPLOAD_BYTES = 12 * 1024 * 1024
+# Max serialized JSON size sent to Featherless (pages[].text is truncated to fit).
+MAX_PDF_JSON_CHARS = 16000
+
+DOCUMENT_READ_SYSTEM_PROMPT = (
+    "You receive JSON built from a patient's medical PDF (pypdf text extraction). "
+    "It always has `format` and `page_count`. The text is in `full_text` (one "
+    "string, preferred when present) **or** in `pages`: an array of "
+    "{page_index, text} per page — use whichever fields you are given.\n\n"
+    "You are not a doctor. This is not a diagnosis. Your job is to infer a "
+    "**trial-matching patient profile** from the document text only.\n\n"
+    "Return ONE JSON object with EXACTLY these keys:\n"
+    '- summary: string — 2-4 sentences in plain language for the patient.\n'
+    '- first_name: string or null — if clearly labeled (e.g. patient name).\n'
+    '- last_name: string or null — if clearly labeled.\n'
+    '- email: string or null — only if an email appears in the document.\n'
+    '- age: integer or null — only if clearly stated (e.g. age, DOB-derived).\n'
+    '- zip_code: string or null — US ZIP or postal info if present.\n'
+    '- diagnosis: string or null — short clinical diagnosis line if present.\n'
+    '- cancer_type: string or null — normalized: breast, lung, colorectal, etc.\n'
+    '- stage: string or null — Roman numeral or stage description if stated.\n'
+    '- biomarkers: object — string keys and string values, e.g. {"HER2": "positive"}; '
+    "{} if none.\n"
+    '- prior_treatments: array of strings — chemo, surgery, radiation, etc.; [] if none.\n'
+    '- performance_status: string or null — ECOG 0-4 or Karnofsky if mentioned.\n'
+    '- comorbidities: array of strings — other conditions; [] if none.\n'
+    '- discuss_with_oncologist: string — one sentence reminding them to discuss '
+    "this with their oncologist before any trial decisions.\n\n"
+    "If the JSON has no usable medical text, say so in summary and use nulls/empty "
+    "collections elsewhere.\n"
+    "Return JSON only. No markdown fences."
+)
+
+
+def pdf_bytes_to_structured_json(data: bytes) -> Dict[str, Any]:
+    """Extract per-page text with pypdf and return a single JSON-serializable dict."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    pages_out: List[Dict[str, Any]] = []
+    for i, page in enumerate(reader.pages):
+        raw = page.extract_text() or ""
+        pages_out.append({"page_index": i + 1, "text": raw.strip()})
+    full_text = "\n\n".join(p["text"] for p in pages_out if p["text"]).strip()
+    return {
+        "format": "pypdf_extract_v1",
+        "page_count": len(reader.pages),
+        "pages": pages_out,
+        "full_text": full_text,
+    }
+
+
+def _json_compact(obj: Any) -> str:
+    """Compact JSON for fewer input tokens and smaller payloads."""
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_extracted_pdf_text(text: str) -> str:
+    """Collapse noisy whitespace so more clinical text fits under the char cap."""
+    if not text:
+        return ""
+    t = text.replace("\x00", " ").strip()
+    t = re.sub(r"\r\n?", "\n", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{4,}", "\n\n\n", t)
+    return t.strip()
+
+
+def _build_pdf_payload_for_model(doc: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
+    """Prefer a single `full_text` blob (less token overhead than per-page JSON).
+
+    If that does not fit `max_chars`, fall back to a normalized `pages` array and
+    trim from the last page until the payload fits.
+    """
+    import copy
+
+    fmt = doc.get("format", "pypdf_extract_v1")
+    pages_in = doc.get("pages") or []
+    full_raw = (doc.get("full_text") or "").strip()
+    full_norm = _normalize_extracted_pdf_text(full_raw) if full_raw else ""
+    if not full_norm and pages_in:
+        full_norm = _normalize_extracted_pdf_text(
+            "\n\n".join((p.get("text") or "").strip() for p in pages_in)
+        )
+
+    pages_copy: List[Dict[str, Any]] = []
+    for p in pages_in:
+        txt = _normalize_extracted_pdf_text((p.get("text") or ""))
+        pages_copy.append(
+            {"page_index": p.get("page_index", len(pages_copy) + 1), "text": txt}
+        )
+
+    def size(obj: Any) -> int:
+        return len(_json_compact(obj))
+
+    only_full: Dict[str, Any] = {
+        "format": fmt,
+        "page_count": len(pages_copy) if pages_copy else (doc.get("page_count") or 0),
+        "full_text": full_norm,
+    }
+    if size(only_full) <= max_chars:
+        return only_full
+
+    d: Dict[str, Any] = {
+        "format": fmt,
+        "page_count": len(pages_copy),
+        "pages": copy.deepcopy(pages_copy),
+    }
+    while size(d) > max_chars:
+        pages = d.get("pages") or []
+        if not pages:
+            d["pages"] = []
+            d["page_count"] = 0
+            return d
+        last = pages[-1]
+        txt = last.get("text") or ""
+        if len(txt) > 400:
+            last["text"] = txt[: len(txt) // 2]
+        else:
+            pages.pop()
+            d["page_count"] = len(pages)
+
+    return d
+
+
+def featherless_read_prepared_pdf_dict(for_model: Dict[str, Any]) -> Dict[str, Any]:
+    """Send already-shrunk pypdf JSON to Featherless; return patient profile fields."""
+    api_key = _featherless_pdf_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Featherless API key not configured "
+            "(set FEATHERLESS_PDF_API_KEY or FEATHERLESS_API_KEY)"
+        )
+    model = FEATHERLESS_PDF_MODEL or FEATHERLESS_MODEL
+    client = OpenAI(
+        api_key=api_key,
+        base_url=FEATHERLESS_BASE_URL,
+        timeout=FEATHERLESS_HTTP_TIMEOUT,
+    )
+    user_body = _json_compact(for_model)
+    completion = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        max_tokens=FEATHERLESS_PDF_MAX_TOKENS,
+        messages=[
+            {"role": "system", "content": DOCUMENT_READ_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Parse this PDF extraction JSON and produce the patient profile JSON.\n"
+                    f"{user_body}"
+                ),
+            },
+        ],
+        timeout=FEATHERLESS_HTTP_TIMEOUT,
+    )
+    raw_text = completion.choices[0].message.content or ""
+    return _extract_json_object(raw_text)
+
+
+def featherless_read_document(structured_pdf: Dict[str, Any]) -> Dict[str, Any]:
+    """Shrink pypdf output to context limits, then call Featherless."""
+    for_model = _build_pdf_payload_for_model(structured_pdf, MAX_PDF_JSON_CHARS)
+    return featherless_read_prepared_pdf_dict(for_model)
+
+
+def _pdf_extraction_public_meta(structured: Dict[str, Any]) -> Dict[str, Any]:
+    """Lightweight summary for API clients (no full page text)."""
+    pages = structured.get("pages") or []
+    return {
+        "format": structured.get("format"),
+        "page_count": structured.get("page_count", len(pages)),
+        "total_text_chars": len(structured.get("full_text") or ""),
+        "chars_per_page": [len((p or {}).get("text") or "") for p in pages],
+    }
 
 
 def _is_concurrency_or_rate_limit(exc: Exception) -> bool:
@@ -1344,6 +1947,7 @@ def _score_single_trial(
     trial: Dict[str, Any],
     trial_index: int,
     reporter: Reporter,
+    patient_profile: Dict[str, Any],
     max_attempts: int = 5,
 ) -> Dict[str, Any]:
     """Score a single trial with its own retry loop.
@@ -1354,7 +1958,7 @@ def _score_single_trial(
 
     Thread-safe — Reporter's queue is thread-safe.
     """
-    user_prompt = _build_scoring_user_prompt(trial, trial_index)
+    user_prompt = _build_scoring_user_prompt(trial, trial_index, patient_profile)
     last_error: Optional[Exception] = None
     title = (trial.get("title") or "Untitled")[:60]
 
@@ -1434,8 +2038,14 @@ class TrialScorer:
     browser-agent scrape is still running.
     """
 
-    def __init__(self, reporter: "Reporter", max_workers: int) -> None:
+    def __init__(
+        self,
+        reporter: "Reporter",
+        max_workers: int,
+        patient_profile: Dict[str, Any],
+    ) -> None:
         self._reporter = reporter
+        self._patient_profile = patient_profile
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, max_workers),
             thread_name_prefix="scorer",
@@ -1554,7 +2164,13 @@ class TrialScorer:
     def _score_and_emit(self, idx: int, trial: Dict[str, Any]) -> None:
         start = time.time()
         try:
-            score = _score_single_trial(self._client, trial, idx, self._reporter)
+            score = _score_single_trial(
+                self._client,
+                trial,
+                idx,
+                self._reporter,
+                self._patient_profile,
+            )
         except Exception as exc:
             self._reporter.log(
                 f"Trial {idx + 1} permanently failed after retries: {exc}",
@@ -1626,10 +2242,121 @@ def react_assets(filename: str) -> Response:
     return send_from_directory(assets_dir, filename)
 
 
+@app.route("/api/health", methods=["GET"])
+def api_health() -> Response:
+    """Lightweight check that Flask is up and /api/* routes are registered."""
+    return jsonify({"ok": True, "service": "trialfind-flask"})
+
+
+# Two paths so dev (Vite proxy) and prod stay reliable: some setups mishandle /api/*.
+@app.route("/api/read-pdf", methods=["POST", "OPTIONS"], strict_slashes=False)
+@app.route("/read-pdf", methods=["POST", "OPTIONS"], strict_slashes=False)
+def api_read_pdf() -> Response:
+    """Accept a PDF upload, extract text locally, then interpret via Featherless."""
+    # CORS preflight must hit this route, not the SPA catch-all (which used to 404 api/*).
+    if request.method == "OPTIONS":
+        return Response(status=204)
+    try:
+        return _api_read_pdf_impl()
+    except Exception as exc:
+        # Always return JSON so the SPA never gets an empty body on unexpected errors.
+        print(f"api_read_pdf unexpected error: {exc}", flush=True)
+        return jsonify({"error": f"Server error while reading PDF: {exc}"}), 500
+
+
+def _api_read_pdf_impl() -> Response:
+    if not _featherless_pdf_api_key():
+        return jsonify(
+            {
+                "error": (
+                    "Featherless API key not configured. "
+                    "Set FEATHERLESS_PDF_API_KEY (PDF upload) and/or FEATHERLESS_API_KEY."
+                )
+            }
+        ), 503
+    if "file" not in request.files:
+        return jsonify({"error": "Missing file field (use multipart name=file)."}), 400
+    upload = request.files["file"]
+    if not upload or not upload.filename:
+        return jsonify({"error": "No file selected."}), 400
+    if not upload.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only .pdf files are supported."}), 400
+    data = upload.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        return jsonify({"error": "File too large."}), 413
+    if len(data) == 0:
+        return jsonify({"error": "Empty file."}), 400
+    try:
+        structured = pdf_bytes_to_structured_json(data)
+    except Exception as exc:
+        return jsonify({"error": f"Could not read PDF: {exc}"}), 400
+    full_text = (structured.get("full_text") or "").strip()
+    has_page_text = any(
+        (p.get("text") or "").strip() for p in (structured.get("pages") or [])
+    )
+    if not full_text and not has_page_text:
+        return jsonify(
+            {
+                "error": (
+                    "No text could be extracted. Scanned/image-only PDFs need OCR — "
+                    "try a text-based export from your hospital portal."
+                )
+            }
+        ), 400
+    raw_json_len = len(json.dumps(structured, ensure_ascii=False))
+    for_model = _build_pdf_payload_for_model(structured, MAX_PDF_JSON_CHARS)
+    json_chars = len(_json_compact(for_model))
+    try:
+        extracted_profile = featherless_read_prepared_pdf_dict(for_model)
+    except ValueError as exc:
+        return jsonify({"error": f"Could not parse model response: {exc}"}), 502
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+    _set_active_pdf_patient(extracted_profile)
+    return jsonify(
+        {
+            "extracted_profile": extracted_profile,
+            "missing_fields": missing_patient_input_ids(extracted_profile),
+            "pdf_extraction": _pdf_extraction_public_meta(structured),
+            "meta": {
+                "filename": upload.filename,
+                "bytes": len(data),
+                "text_chars_extracted": len(full_text) if full_text else sum(
+                    len((p.get("text") or "")) for p in (structured.get("pages") or [])
+                ),
+                "json_chars_sent_to_model": json_chars,
+                "json_truncated_for_model": raw_json_len > MAX_PDF_JSON_CHARS,
+            },
+        }
+    )
+
+
+@app.route("/api/patient-profile", methods=["POST", "OPTIONS"], strict_slashes=False)
+@app.route("/patient-profile", methods=["POST", "OPTIONS"], strict_slashes=False)
+def api_patient_profile() -> Response:
+    """Merge user-entered fields into the active PDF profile (same store as /read-pdf)."""
+    if request.method == "OPTIONS":
+        return Response(status=204)
+    try:
+        payload = request.get_json(force=True, silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "Send a JSON object with profile fields to update."}), 400
+        merge_patient_profile_updates(payload)
+    except RuntimeError as exc:
+        return jsonify({"error": str(exc)}), 400
+    merged = _active_pdf_patient or {}
+    return jsonify(
+        {
+            "extracted_profile": merged,
+            "missing_fields": missing_patient_input_ids(merged),
+        }
+    )
+
+
 # SPA fallback: serve real files from dist when they exist, otherwise serve
-# index.html. API routes (find-trials, find-trials-stream) take precedence
-# because they are registered above with more specific rules.
-@app.route("/<path:path>")
+# index.html. GET/HEAD only — do not bind POST/OPTIONS here or uploads and
+# CORS preflights can match this rule and hit `abort(404)` for api/* paths.
+@app.route("/<path:path>", methods=["GET", "HEAD"])
 def spa_fallback(path: str) -> Response:
     if path.startswith(("find-trials", "api/")):
         abort(404)
@@ -1663,7 +2390,8 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     # automatically fan out a technical log AND a friendly one-liner.
     featherless_key = os.getenv("FEATHERLESS_API_KEY")
     translator: Optional[FriendlyTranslator] = None
-    if featherless_key:
+    _fs = (FEATHERLESS_FRIENDLY_STATUS or "").strip().lower()
+    if featherless_key and _fs not in ("0", "false", "no", "off"):
         translator = FriendlyTranslator(
             featherless_key, FEATHERLESS_MODEL, reporter
         )
@@ -1674,6 +2402,12 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         "NCI Cancer.gov, and Mayo Clinic."
     )
 
+    patient = get_patient_for_pipeline()
+    if _active_pdf_patient is not None:
+        reporter.milestone(
+            "Using the patient profile from your uploaded PDF for trial matching."
+        )
+
     prewarm_featherless(reporter)
 
     # Stand the async per-trial scorer up BEFORE any fetch step runs, and
@@ -1681,11 +2415,15 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     # call (inside each fetch function) immediately hands the trial off to
     # the scorer, which scores it on a background thread — overlapping
     # scoring with the remaining fetch work.
-    scorer = TrialScorer(reporter, max_workers=FEATHERLESS_MAX_CONCURRENCY)
+    scorer = TrialScorer(
+        reporter,
+        max_workers=FEATHERLESS_MAX_CONCURRENCY,
+        patient_profile=patient,
+    )
     reporter.scorer = scorer
 
     try:
-        clinical_trials = fetch_clinical_trials(reporter)
+        clinical_trials = fetch_clinical_trials(reporter, patient)
     except Exception as exc:
         msg = f"Step 1 failed: {exc}"
         errors.append(msg)
@@ -1693,7 +2431,7 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         reporter.step(1, "error", str(exc), title="ClinicalTrials.gov API")
 
     try:
-        nci_trials = fetch_nci_trials(reporter)
+        nci_trials = fetch_nci_trials(reporter, patient)
     except Exception as exc:
         msg = f"Step 2 failed: {exc}"
         errors.append(msg)
@@ -1701,12 +2439,22 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         reporter.step(2, "error", str(exc), title="NCI Cancer.gov API")
 
     try:
-        mayo_trials = fetch_mayo_trials(reporter)
+        mayo_trials = fetch_mayo_trials(reporter, patient)
     except Exception as exc:
         msg = f"Step 3 failed: {exc}"
         errors.append(msg)
         reporter.log(msg, step=3)
         reporter.step(3, "error", str(exc), title="Mayo Clinic browser agent (Tinyfish)")
+
+    if (
+        os.getenv("TINYFISH_API_KEY")
+        and len(mayo_trials) == 0
+        and not any(str(e).startswith("Step 3 failed") for e in errors)
+    ):
+        errors.append(
+            "Mayo Clinic: no trials were returned (0 search links). "
+            "Broader keywords are retried automatically; if this persists, check Step 3 in the technical log."
+        )
 
     # All fetch sources done — raw_trials is the deduped, schedule-ordered
     # list that the scorer already owns.
@@ -1759,7 +2507,7 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         reporter.translator = None
 
     return {
-        "patient_profile": DEMO_PATIENT,
+        "patient_profile": patient,
         "raw_trials": raw_trials,
         "scored_trials": scored_trials,
         "meta": {
