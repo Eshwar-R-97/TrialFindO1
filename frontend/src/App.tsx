@@ -26,6 +26,8 @@ export default function App() {
         <StatusTicker
           friendlyStatus={stream.friendlyStatus}
           running={stream.running}
+          trialsFound={stream.rawTrials.length}
+          scoredCount={stream.scored.length}
         />
 
         <ScoredMatchesTable scored={stream.scored} running={stream.running} />

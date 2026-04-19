@@ -1,5 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { Activity } from "lucide-react";
+import { Activity, Search, Sparkles } from "lucide-react";
 import type { FriendlyStatus } from "../types";
 import { cn } from "../lib/utils";
 
@@ -10,20 +10,71 @@ interface StatusTickerProps {
   // Before the first friendly_status arrives, we show a gentle placeholder.
   friendlyStatus: FriendlyStatus | null;
   running: boolean;
+  // Live counters, rendered on the right-hand side so the ticker row shows
+  // both "what's happening now" and "what's been found so far" in one place.
+  trialsFound: number;
+  scoredCount: number;
+}
+
+// A single counter pill that briefly pulses when its value changes. We key
+// the motion element on the value itself so framer-motion re-animates it.
+function CounterPill({
+  icon,
+  label,
+  value,
+  tone,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: number;
+  tone: "blue" | "emerald";
+}) {
+  const tones = {
+    blue: "bg-blue-50 text-blue-700 ring-blue-100",
+    emerald: "bg-emerald-50 text-emerald-700 ring-emerald-100",
+  };
+  return (
+    <div
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ring-inset",
+        tones[tone]
+      )}
+    >
+      {icon}
+      <AnimatePresence mode="popLayout" initial={false}>
+        <motion.span
+          key={value}
+          initial={{ opacity: 0, y: -6 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 6 }}
+          transition={{ duration: 0.18 }}
+          className="tabular-nums"
+        >
+          {value}
+        </motion.span>
+      </AnimatePresence>
+      <span className="font-medium opacity-80">{label}</span>
+    </div>
+  );
 }
 
 export function StatusTicker({
   friendlyStatus,
   running,
+  trialsFound,
+  scoredCount,
 }: StatusTickerProps) {
   // While the pipeline is running but the first LLM rewrite hasn't landed
   // yet, show a calm placeholder so the ticker never flashes jargon.
   const showIdleRunning = running && !friendlyStatus;
   const showIdle = !running && !friendlyStatus;
+  // Counter row is hidden when nothing has been found AND the pipeline isn't
+  // running — keeps the ticker clean in the true idle state.
+  const showCounters = running || trialsFound > 0 || scoredCount > 0;
 
   return (
     <div className="relative overflow-hidden rounded-2xl border border-border bg-card p-5 shadow-soft sm:p-6">
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-4">
         <span
           className={cn(
             "h-2.5 w-2.5 shrink-0 rounded-full",
@@ -31,7 +82,7 @@ export function StatusTicker({
           )}
         />
 
-        <div className="relative min-h-[1.25rem] flex-1 overflow-hidden">
+        <div className="relative min-h-[1.25rem] min-w-0 flex-1 overflow-hidden">
           <AnimatePresence mode="popLayout" initial={false}>
             {friendlyStatus ? (
               <motion.div
@@ -75,6 +126,23 @@ export function StatusTicker({
             ) : null}
           </AnimatePresence>
         </div>
+
+        {showCounters && (
+          <div className="hidden shrink-0 items-center gap-2 sm:flex">
+            <CounterPill
+              tone="blue"
+              icon={<Search className="h-3.5 w-3.5" />}
+              value={trialsFound}
+              label={trialsFound === 1 ? "trial found" : "trials found"}
+            />
+            <CounterPill
+              tone="emerald"
+              icon={<Sparkles className="h-3.5 w-3.5" />}
+              value={scoredCount}
+              label={scoredCount === 1 ? "match scored" : "matches scored"}
+            />
+          </div>
+        )}
       </div>
     </div>
   );
