@@ -24,7 +24,6 @@ export default function App() {
         <PipelinePanel steps={stream.steps} />
 
         <StatusTicker
-          logs={stream.logs}
           friendlyStatus={stream.friendlyStatus}
           running={stream.running}
         />

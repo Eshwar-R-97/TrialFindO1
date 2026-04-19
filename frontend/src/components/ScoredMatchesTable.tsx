@@ -149,12 +149,6 @@ export function ScoredMatchesTable({ scored, running }: ScoredMatchesTableProps)
   const getId = (e: ScoredEntry) =>
     `${e.score.trial_index}-${e.trial.nct_id ?? e.trial.title.slice(0, 24)}`;
 
-  // Auto-open the top result when it arrives.
-  const topId = scored.length > 0 ? getId(scored[0]) : null;
-  if (topId && openId === null) {
-    queueMicrotask(() => setOpenId(topId));
-  }
-
   return (
     <Panel
       title="Scored matches"
