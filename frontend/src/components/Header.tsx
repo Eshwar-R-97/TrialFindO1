@@ -14,21 +14,6 @@ const NAV_LINKS = [
   { label: "For Clinics", href: "#for-clinics" },
 ];
 
-function TrialFindMark({ size = 28 }: { size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 200 200" fill="none" aria-hidden="true">
-      <circle cx="100" cy="100" r="68" stroke="#1D9E75" strokeWidth="5" />
-      <circle cx="100" cy="100" r="44" stroke="#1D9E75" strokeWidth="2.5" />
-      <circle cx="100" cy="100" r="20" fill="#1D9E75" />
-      <line x1="32" y1="100" x2="56" y2="100" stroke="#1D9E75" strokeWidth="4" strokeLinecap="round" />
-      <line x1="144" y1="100" x2="168" y2="100" stroke="#1D9E75" strokeWidth="4" strokeLinecap="round" />
-      <line x1="100" y1="32" x2="100" y2="56" stroke="#1D9E75" strokeWidth="4" strokeLinecap="round" />
-      <line x1="100" y1="144" x2="100" y2="168" stroke="#1D9E75" strokeWidth="4" strokeLinecap="round" />
-      <circle cx="100" cy="100" r="7" fill="white" />
-    </svg>
-  );
-}
-
 export function Header({ running, onRun, hasProfile }: HeaderProps) {
   const [scrolled, setScrolled] = useState(false);
 
@@ -53,7 +38,7 @@ export function Header({ running, onRun, hasProfile }: HeaderProps) {
       <div className="mx-auto flex h-16 max-w-[1280px] items-center justify-between gap-4 px-6 lg:px-8">
         {/* Logo */}
         <a href="#" className="flex select-none items-center gap-2.5">
-          <TrialFindMark size={28} />
+          <img src="/trialfind_mark.svg" width={28} height={28} alt="" aria-hidden="true" />
           <span
             className="text-[20px] font-bold leading-none tracking-tight text-white"
             style={{ fontFamily: "Georgia, serif" }}

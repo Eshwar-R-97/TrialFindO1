@@ -283,12 +283,7 @@ export default function App() {
       >
         <div className="mx-auto max-w-[1200px]">
           <div className="flex flex-col items-center justify-between gap-6 sm:flex-row">
-            <span
-              className="text-[18px] font-bold tracking-tight text-white select-none"
-              style={{ fontFamily: "Georgia, serif" }}
-            >
-              Trial<span style={{ color: "#1D9E75" }}>Find</span>
-            </span>
+            <img src="/trialfind_wordmark.svg" alt="TrialFind" height={36} className="select-none" />
             <div className="flex flex-wrap items-center justify-center gap-6 text-sm text-gray-600">
               <a href="#for-patients" className="transition-colors hover:text-gray-300">
                 For Patients

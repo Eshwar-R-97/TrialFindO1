@@ -1,12 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="200" height="200" viewBox="0 0 200 200" role="img">
 <title>TrialFind app icon</title>
 <rect x="0" y="0" width="200" height="200" rx="44" fill="#085041"/>
-<circle cx="100" cy="100" r="58" fill="none" stroke="#1D9E75" stroke-width="3"/>
-<circle cx="100" cy="100" r="37" fill="none" stroke="#1D9E75" stroke-width="1.5"/>
-<circle cx="100" cy="100" r="16" fill="#1D9E75"/>
-<line x1="42" y1="100" x2="63" y2="100" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-<line x1="137" y1="100" x2="158" y2="100" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-<line x1="100" y1="42" x2="100" y2="63" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-<line x1="100" y1="137" x2="100" y2="158" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-<circle cx="100" cy="100" r="6" fill="white"/>
+<circle cx="96" cy="96" r="70" fill="none" stroke="#9FE1CB" stroke-width="3.5"/>
+<line x1="146" y1="146" x2="174" y2="176" stroke="#9FE1CB" stroke-width="7" stroke-linecap="round"/>
+<path d="M84 30 L84 68 L52 116 Q44 130 44 140 Q44 160 62 167 Q72 170 96 170 Q120 170 130 167 Q148 160 148 140 Q148 130 140 116 L108 68 L108 30 Z" fill="#E1F5EE" opacity="0.92" stroke="#9FE1CB" stroke-width="2.5" stroke-linejoin="round"/>
+<rect x="78" y="19" width="36" height="13" rx="4" fill="#9FE1CB"/>
+<path d="M44 132 L44 140 Q44 160 62 167 Q72 170 96 170 Q120 170 130 167 Q148 160 148 140 L148 132 Z" fill="#1D9E75"/>
+<circle cx="62" cy="148" r="5" fill="white" opacity="0.5"/>
+<circle cx="76" cy="160" r="3" fill="white" opacity="0.4"/>
+<circle cx="120" cy="150" r="4" fill="white" opacity="0.4"/>
+<line x1="84" y1="68" x2="108" y2="68" stroke="#9FE1CB" stroke-width="1.5" opacity="0.4"/>
 </svg>

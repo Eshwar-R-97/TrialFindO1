@@ -1,19 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="680" height="220" viewBox="0 0 680 220" role="img">
 <title>TrialFind logo</title>
-<desc>A teal crosshair target circle beside the TrialFind wordmark</desc>
-
-<circle cx="110" cy="110" r="68" fill="none" stroke="#1D9E75" stroke-width="3"/>
-<circle cx="110" cy="110" r="44" fill="none" stroke="#1D9E75" stroke-width="1.5"/>
-<circle cx="110" cy="110" r="20" fill="#1D9E75"/>
-
-<line x1="42" y1="110" x2="66" y2="110" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-<line x1="154" y1="110" x2="178" y2="110" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-<line x1="110" y1="42" x2="110" y2="66" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-<line x1="110" y1="154" x2="110" y2="178" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-
-<circle cx="110" cy="110" r="6" fill="white"/>
-
-<text x="200" y="96" font-family="Georgia, serif" font-size="52" font-weight="700" fill="#1D9E75" letter-spacing="-1">Trial</text>
-<text x="335" y="96" font-family="Georgia, serif" font-size="52" font-weight="700" fill="#085041" letter-spacing="-1">Find</text>
-<text x="200" y="128" font-family="Arial, sans-serif" font-size="16" fill="#5F5E5A" letter-spacing="3.5">CLINICAL TRIAL MATCHING</text>
+<desc>Erlenmeyer flask with teal liquid inside a magnifying glass beside the TrialFind wordmark</desc>
+<circle cx="110" cy="100" r="78" fill="none" stroke="#085041" stroke-width="4"/>
+<line x1="168" y1="156" x2="202" y2="192" stroke="#085041" stroke-width="8" stroke-linecap="round"/>
+<path d="M96 26 L96 68 L60 124 Q50 140 50 152 Q50 174 72 182 Q82 186 110 186 Q138 186 148 182 Q170 174 170 152 Q170 140 160 124 L124 68 L124 26 Z" fill="#E1F5EE" stroke="#085041" stroke-width="3" stroke-linejoin="round"/>
+<rect x="89" y="14" width="42" height="15" rx="4" fill="#085041"/>
+<path d="M50 144 L50 152 Q50 174 72 182 Q82 186 110 186 Q138 186 148 182 Q170 174 170 152 L170 144 Z" fill="#1D9E75" opacity="0.8"/>
+<circle cx="72" cy="160" r="6" fill="white" opacity="0.5"/>
+<circle cx="86" cy="174" r="4" fill="white" opacity="0.4"/>
+<circle cx="130" cy="162" r="5" fill="white" opacity="0.4"/>
+<circle cx="146" cy="173" r="3" fill="white" opacity="0.35"/>
+<line x1="96" y1="68" x2="124" y2="68" stroke="#085041" stroke-width="1.5" opacity="0.35"/>
+<text x="208" y="92" font-family="Georgia, serif" font-size="52" font-weight="700" fill="#1D9E75" letter-spacing="-1">Trial</text>
+<text x="343" y="92" font-family="Georgia, serif" font-size="52" font-weight="700" fill="#085041" letter-spacing="-1">Find</text>
+<text x="208" y="124" font-family="Arial, sans-serif" font-size="14" fill="#888780" letter-spacing="3.5">CLINICAL TRIAL MATCHING</text>
 </svg>

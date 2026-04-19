@@ -35,6 +35,10 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ReadPdfResponse | null>(null);
   const [gapFormSaved, setGapFormSaved] = useState(false);
+  const [userName, setUserName] = useState("");
+  const [userEmail, setUserEmail] = useState("");
+
+  const canUpload = userName.trim().length > 0 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(userEmail.trim());
 
   const onFile = useCallback(async (file: File | null) => {
     if (!file) return;
@@ -53,17 +57,25 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
         throw new Error("Invalid response from server");
       }
       const ok = json as ReadPdfResponse;
-      setResult(ok);
-      if (ok.extracted_profile) {
+      const nameParts = userName.trim().split(/\s+/);
+      const mergedProfile: PatientProfileExtracted = {
+        ...ok.extracted_profile,
+        first_name: nameParts[0] ?? ok.extracted_profile.first_name,
+        last_name: nameParts.slice(1).join(" ") || ok.extracted_profile.last_name,
+        email: userEmail.trim() || ok.extracted_profile.email,
+      };
+      const mergedResult = { ...ok, extracted_profile: mergedProfile };
+      setResult(mergedResult);
+      if (mergedResult.extracted_profile) {
         setGapFormSaved(false);
-        onProfileReady?.(ok.extracted_profile);
+        onProfileReady?.(mergedResult.extracted_profile);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, [onProfileReady]);
+  }, [onProfileReady, userName, userEmail]);
 
   const mergeProfile = useCallback(
     async (patch: Record<string, string | number | string[]>) => {
@@ -103,15 +115,25 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
 
   const profile = result?.extracted_profile;
 
+  const inputBase =
+    "w-full rounded-xl border border-gray-200 bg-white px-3 py-2 text-sm text-gray-900 outline-none transition focus:border-brand-400 focus:ring-2 focus:ring-brand-100 placeholder:text-gray-300";
+
   return (
     <section className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm sm:p-8">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+      <div className="flex items-start gap-5">
+        <img
+          src="/trialfind_upload_icon.svg"
+          alt=""
+          aria-hidden="true"
+          className="hidden shrink-0 sm:block"
+          style={{ width: 64, height: 75 }}
+        />
         <div>
           <p className="mb-1.5 text-[11px] font-bold uppercase tracking-[0.1em] text-brand-500">
-            Step 1 — Upload your records
+            Step 1 — Your information
           </p>
           <h2 className="text-xl font-bold tracking-tight text-gray-900 sm:text-2xl">
-            Upload a pathology or visit-summary PDF
+            Tell us who you are, then upload your records
           </h2>
           <p className="mt-2 max-w-prose text-sm text-gray-500">
             Your document is read securely on our server.{" "}
@@ -119,18 +141,60 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
             your medical profile for trial matching — never for diagnosis.
           </p>
         </div>
-        <label className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-gray-200 bg-white px-5 py-2.5 text-sm font-semibold text-gray-700 shadow-sm transition hover:border-brand-300 hover:bg-brand-50 hover:text-brand-700">
+      </div>
+
+      {/* Required name + email */}
+      <div className="mt-5 grid gap-3 sm:grid-cols-2">
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] font-semibold uppercase tracking-[0.1em] text-gray-500">
+            Full name <span className="text-red-400">*</span>
+          </span>
+          <input
+            type="text"
+            placeholder="Jane Smith"
+            value={userName}
+            onChange={(e) => setUserName(e.target.value)}
+            className={inputBase}
+          />
+        </label>
+        <label className="flex flex-col gap-1">
+          <span className="text-[11px] font-semibold uppercase tracking-[0.1em] text-gray-500">
+            Email address <span className="text-red-400">*</span>
+          </span>
+          <input
+            type="email"
+            placeholder="jane@example.com"
+            value={userEmail}
+            onChange={(e) => setUserEmail(e.target.value)}
+            className={inputBase}
+          />
+        </label>
+      </div>
+
+      <div className="mt-4 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-xs text-gray-400">
+          {canUpload
+            ? "Ready — choose your PDF below."
+            : "Enter your name and a valid email to unlock the upload."}
+        </p>
+        <label
+          className={`inline-flex items-center gap-2 rounded-full border px-5 py-2.5 text-sm font-semibold shadow-sm transition ${
+            canUpload && !loading
+              ? "cursor-pointer border-gray-200 bg-white text-gray-700 hover:border-brand-300 hover:bg-brand-50 hover:text-brand-700"
+              : "cursor-not-allowed border-gray-100 bg-gray-50 text-gray-300"
+          }`}
+        >
           {loading ? (
             <Loader2 className="h-4 w-4 animate-spin text-brand-500" />
           ) : (
-            <FileText className="h-4 w-4 text-gray-400" />
+            <FileText className="h-4 w-4" />
           )}
           <span>{loading ? "Reading…" : "Choose PDF"}</span>
           <input
             type="file"
             accept="application/pdf,.pdf"
             className="sr-only"
-            disabled={loading}
+            disabled={loading || !canUpload}
             onChange={(e) => {
               const f = e.target.files?.[0] ?? null;
               void onFile(f);

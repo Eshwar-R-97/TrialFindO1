@@ -3,11 +3,11 @@
 <rect x="10" y="10" width="88" height="120" rx="8" fill="#E1F5EE"/>
 <rect x="10" y="10" width="88" height="120" rx="8" fill="none" stroke="#1D9E75" stroke-width="2"/>
 <path d="M72 10 L98 36 L72 36 Z" fill="#1D9E75" opacity="0.5"/>
-<rect x="72" y="10" width="26" height="26" rx="0" fill="#1D9E75" opacity="0.2"/>
-<line x1="26" y1="72" x2="82" y2="72" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
-<line x1="26" y1="88" x2="70" y2="88" stroke="#1D9E75" stroke-width="1.5" stroke-linecap="round" opacity="0.6"/>
-<line x1="26" y1="104" x2="74" y2="104" stroke="#1D9E75" stroke-width="1.5" stroke-linecap="round" opacity="0.6"/>
-<circle cx="54" cy="42" r="14" fill="#085041"/>
-<line x1="54" y1="35" x2="54" y2="49" stroke="white" stroke-width="2" stroke-linecap="round"/>
-<line x1="47" y1="42" x2="61" y2="42" stroke="white" stroke-width="2" stroke-linecap="round"/>
+<rect x="72" y="10" width="26" height="26" fill="#1D9E75" opacity="0.2"/>
+<circle cx="60" cy="56" r="18" fill="none" stroke="#085041" stroke-width="2.5"/>
+<line x1="73" y1="69" x2="83" y2="79" stroke="#085041" stroke-width="4" stroke-linecap="round"/>
+<path d="M54 44 L54 54 Q54 60 60 60 Q66 60 66 54 L66 44 Q66 38 60 38 Q54 38 54 44 Z" fill="#1D9E75" opacity="0.6" stroke="#085041" stroke-width="1.5"/>
+<line x1="26" y1="96" x2="82" y2="96" stroke="#1D9E75" stroke-width="2.5" stroke-linecap="round"/>
+<line x1="26" y1="112" x2="70" y2="112" stroke="#1D9E75" stroke-width="1.5" stroke-linecap="round" opacity="0.6"/>
+<line x1="26" y1="126" x2="74" y2="126" stroke="#1D9E75" stroke-width="1.5" stroke-linecap="round" opacity="0.6"/>
 </svg>

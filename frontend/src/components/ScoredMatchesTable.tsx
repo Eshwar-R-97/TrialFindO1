@@ -389,6 +389,11 @@ export function ScoredMatchesTable({
             : "No matches yet. Click Find Trials above to run the pipeline."}
         </p>
       ) : (
+        <>
+        <div className="mb-3 flex items-center gap-2">
+          <span className="text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400">Match levels:</span>
+          <img src="/trialfind_criterion_icons.svg" alt="Pass / Unknown / Fail legend" style={{ height: 28 }} />
+        </div>
         <div className="overflow-hidden rounded-xl border border-gray-100 bg-white">
           <div className="overflow-x-auto">
             <table className="w-full border-collapse text-sm">
@@ -535,6 +540,7 @@ export function ScoredMatchesTable({
             </table>
           </div>
         </div>
+        </>
       )}
     </Panel>
   );
