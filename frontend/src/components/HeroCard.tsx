@@ -1,9 +1,12 @@
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, Loader2, Search } from "lucide-react";
+import { motion } from "framer-motion";
 import type { PatientProfileExtracted } from "../types";
 
 interface HeroCardProps {
   errors: string[];
   patientProfile?: PatientProfileExtracted | null;
+  onRun?: () => void;
+  running?: boolean;
 }
 
 function chipsFromProfile(p: PatientProfileExtracted) {
@@ -21,7 +24,7 @@ function chipsFromProfile(p: PatientProfileExtracted) {
   ];
 }
 
-export function HeroCard({ errors, patientProfile }: HeroCardProps) {
+export function HeroCard({ errors, patientProfile, onRun, running }: HeroCardProps) {
   if (!patientProfile) return null;
 
   const chips = chipsFromProfile(patientProfile);
@@ -53,6 +56,33 @@ export function HeroCard({ errors, patientProfile }: HeroCardProps) {
             <span className="mt-0.5 text-sm font-semibold text-gray-900">{chip.value}</span>
           </div>
         ))}
+      </div>
+
+      <div className="mt-5">
+        <motion.button
+          type="button"
+          onClick={onRun}
+          disabled={running}
+          whileHover={!running ? { scale: 1.03 } : undefined}
+          whileTap={!running ? { scale: 0.97 } : undefined}
+          className={
+            running
+              ? "inline-flex items-center gap-2 rounded-full bg-gray-100 px-6 py-2.5 text-sm font-semibold text-gray-400 cursor-not-allowed"
+              : "inline-flex items-center gap-2 rounded-full bg-brand-500 px-6 py-2.5 text-sm font-semibold text-white shadow-sm transition-all hover:bg-brand-400"
+          }
+        >
+          {running ? (
+            <>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              Searching…
+            </>
+          ) : (
+            <>
+              <Search className="h-4 w-4" />
+              Find Trials
+            </>
+          )}
+        </motion.button>
       </div>
 
       {errors.length > 0 && (

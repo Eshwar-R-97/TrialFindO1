@@ -138,6 +138,8 @@ export default function App() {
                   <HeroCard
                     errors={stream.errors}
                     patientProfile={pdfPatient}
+                    onRun={stream.start}
+                    running={stream.running}
                   />
                 </motion.div>
 
