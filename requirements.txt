@@ -3,3 +3,4 @@ requests
 openai
 tinyfish
 python-dotenv
+supabase
