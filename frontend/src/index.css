@@ -14,6 +14,10 @@
   --primary-foreground: 0 0% 100%;
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
 html,
 body,
 #root {
@@ -26,11 +30,49 @@ body {
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  background: #ffffff;
+  background: #020c07;
   color: hsl(var(--foreground));
 }
 
-/* Scoped log panel styles. The rest of the UI is Tailwind utility classes. */
+/* Animated gradient text — Stripe-style */
+.gradient-text {
+  background: linear-gradient(
+    90deg,
+    #5ee8b3 0%,
+    #1D9E75 25%,
+    #a3e8d1 50%,
+    #3dbb96 75%,
+    #5ee8b3 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: gradientShift 4s linear infinite;
+}
+
+/* Dot grid overlay for hero */
+.dot-grid {
+  background-image: radial-gradient(circle, rgba(255, 255, 255, 0.055) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+/* Line grid for light sections */
+.line-grid {
+  background-image:
+    linear-gradient(rgba(0, 0, 0, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 0, 0, 0.03) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+/* Glassmorphism card on dark bg */
+.glass-card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(12px);
+}
+
+/* Scoped log panel styles */
 .log-line {
   display: block;
   padding: 1px 0;
@@ -47,42 +89,20 @@ body {
 }
 
 .log-line.step-1 .step-tag,
-.log-line.step-1 .msg {
-  color: #86efac;
-}
-
+.log-line.step-1 .msg { color: #86efac; }
 .log-line.step-2 .step-tag,
-.log-line.step-2 .msg {
-  color: #fde68a;
-}
-
+.log-line.step-2 .msg { color: #fde68a; }
 .log-line.step-3 .step-tag,
-.log-line.step-3 .msg {
-  color: #fdba74;
-}
-
+.log-line.step-3 .msg { color: #fdba74; }
 .log-line.step-4 .step-tag,
-.log-line.step-4 .msg {
-  color: #f9a8d4;
-}
-
+.log-line.step-4 .msg { color: #f9a8d4; }
 .log-line.error .step-tag,
-.log-line.error .msg {
-  color: #fca5a5;
-  font-weight: 600;
-}
+.log-line.error .msg { color: #fca5a5; font-weight: 600; }
+.log-line.system .msg { color: #c4b5fd; }
 
-.log-line.system .msg {
-  color: #c4b5fd;
-}
-
-/* Nicer scrollbar on the log panel */
-.log-panel::-webkit-scrollbar {
-  width: 8px;
-}
-.log-panel::-webkit-scrollbar-track {
-  background: transparent;
-}
+/* Log panel scrollbar */
+.log-panel::-webkit-scrollbar { width: 8px; }
+.log-panel::-webkit-scrollbar-track { background: transparent; }
 .log-panel::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.08);
   border-radius: 4px;

@@ -9,13 +9,6 @@ interface HeroCardProps {
   patientProfile?: PatientProfileExtracted | null;
 }
 
-const DEMO_CHIPS = [
-  { label: "Diagnosis", value: "Stage 3 breast cancer" },
-  { label: "Age", value: "48" },
-  { label: "Location", value: "Minneapolis, MN" },
-  { label: "Prior treatment", value: "Chemotherapy" },
-];
-
 function chipsFromProfile(p: PatientProfileExtracted) {
   const name = [p.first_name, p.last_name].filter(Boolean).join(" ").trim();
   const priors = Array.isArray(p.prior_treatments)
@@ -38,14 +31,16 @@ export function HeroCard({
   running,
   patientProfile,
 }: HeroCardProps) {
-  const chips = patientProfile ? chipsFromProfile(patientProfile) : DEMO_CHIPS;
+  if (!patientProfile) return null;
+
+  const chips = chipsFromProfile(patientProfile);
 
   return (
     <section className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm sm:p-8">
       <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="mb-1.5 text-[11px] font-bold uppercase tracking-[0.1em] text-brand-500">
-            {patientProfile ? "Active patient · from PDF" : "Demo patient"}
+            Patient profile · from PDF
           </p>
           <h3 className="text-xl font-bold tracking-tight text-gray-900 sm:text-2xl">
             Matching recruiting trials to this profile

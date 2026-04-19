@@ -149,7 +149,6 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
           profile={profile}
           meta={result.meta}
           pdfExtraction={result.pdf_extraction}
-          missingFields={result.missing_fields ?? []}
           onMergeProfile={mergeProfile}
         />
       )}
@@ -161,13 +160,11 @@ function ExtractedProfileView({
   profile,
   meta,
   pdfExtraction,
-  missingFields,
   onMergeProfile,
 }: {
   profile: PatientProfileExtracted;
   meta: ReadPdfResponse["meta"];
   pdfExtraction: ReadPdfResponse["pdf_extraction"];
-  missingFields: string[];
   onMergeProfile: (patch: Record<string, string | number | string[]>) => Promise<void>;
 }) {
   const biomarkersRaw = profile.biomarkers;
@@ -194,8 +191,7 @@ function ExtractedProfileView({
   return (
     <div className="mt-6 space-y-4">
       <PatientProfileGapForm
-        key={missingFields.join("|")}
-        missingFields={missingFields}
+        key={JSON.stringify(profile)}
         current={profile}
         onSave={onMergeProfile}
       />
