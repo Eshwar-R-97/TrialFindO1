@@ -34,6 +34,7 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ReadPdfResponse | null>(null);
+  const [gapFormSaved, setGapFormSaved] = useState(false);
 
   const onFile = useCallback(async (file: File | null) => {
     if (!file) return;
@@ -54,6 +55,7 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
       const ok = json as ReadPdfResponse;
       setResult(ok);
       if (ok.extracted_profile) {
+        setGapFormSaved(false);
         onProfileReady?.(ok.extracted_profile);
       }
     } catch (e) {
@@ -150,6 +152,8 @@ export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) 
           meta={result.meta}
           pdfExtraction={result.pdf_extraction}
           onMergeProfile={mergeProfile}
+          saved={gapFormSaved}
+          onGapFormSaved={() => setGapFormSaved(true)}
         />
       )}
     </section>
@@ -161,11 +165,15 @@ function ExtractedProfileView({
   meta,
   pdfExtraction,
   onMergeProfile,
+  saved,
+  onGapFormSaved,
 }: {
   profile: PatientProfileExtracted;
   meta: ReadPdfResponse["meta"];
   pdfExtraction: ReadPdfResponse["pdf_extraction"];
   onMergeProfile: (patch: Record<string, string | number | string[]>) => Promise<void>;
+  saved: boolean;
+  onGapFormSaved: () => void;
 }) {
   const biomarkersRaw = profile.biomarkers;
   const biomarkerEntries = Object.entries(
@@ -194,73 +202,78 @@ function ExtractedProfileView({
         key={JSON.stringify(profile)}
         current={profile}
         onSave={onMergeProfile}
+        onSaved={onGapFormSaved}
       />
       <p className="text-xs text-gray-400">
         {meta.filename} · {pdfExtraction.page_count} page(s) ·{" "}
         {meta.text_chars_extracted.toLocaleString()} chars extracted
         {meta.json_truncated_for_model ? " (shrunk to fit context)" : ""}
       </p>
-      <div className="rounded-xl border border-gray-100 bg-gray-50 p-4 text-sm leading-relaxed">
-        <p className="font-semibold text-gray-500">Summary</p>
-        <p className="mt-1.5 text-gray-800">{profile.summary}</p>
-      </div>
-      <div className="flex flex-wrap gap-2.5">
-        {chips.map((c) => (
-          <div
-            key={c.label}
-            className="flex min-w-[120px] flex-col rounded-xl border border-gray-100 bg-gray-50 px-4 py-2.5"
-          >
-            <span className="text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
-              {c.label}
-            </span>
-            <span className="mt-0.5 text-sm font-semibold text-gray-900">{c.value}</span>
+      {!saved && (
+        <>
+          <div className="rounded-xl border border-gray-100 bg-gray-50 p-4 text-sm leading-relaxed">
+            <p className="font-semibold text-gray-500">Summary</p>
+            <p className="mt-1.5 text-gray-800">{profile.summary}</p>
           </div>
-        ))}
-      </div>
-      {biomarkerEntries.length > 0 && (
-        <div>
-          <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
-            Biomarkers
-          </p>
-          <div className="flex flex-wrap gap-2">
-            {biomarkerEntries.map(([k, v]) => (
-              <span
-                key={k}
-                className="rounded-lg border border-gray-100 bg-white px-2.5 py-1 text-xs text-gray-700"
+          <div className="flex flex-wrap gap-2.5">
+            {chips.map((c) => (
+              <div
+                key={c.label}
+                className="flex min-w-[120px] flex-col rounded-xl border border-gray-100 bg-gray-50 px-4 py-2.5"
               >
-                <span className="font-semibold">{k}</span>: {v}
-              </span>
+                <span className="text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
+                  {c.label}
+                </span>
+                <span className="mt-0.5 text-sm font-semibold text-gray-900">{c.value}</span>
+              </div>
             ))}
           </div>
-        </div>
-      )}
-      {Array.isArray(profile.prior_treatments) && profile.prior_treatments.length > 0 && (
-        <div>
-          <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
-            Prior treatments
+          {biomarkerEntries.length > 0 && (
+            <div>
+              <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
+                Biomarkers
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {biomarkerEntries.map(([k, v]) => (
+                  <span
+                    key={k}
+                    className="rounded-lg border border-gray-100 bg-white px-2.5 py-1 text-xs text-gray-700"
+                  >
+                    <span className="font-semibold">{k}</span>: {v}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {Array.isArray(profile.prior_treatments) && profile.prior_treatments.length > 0 && (
+            <div>
+              <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
+                Prior treatments
+              </p>
+              <ul className="list-inside list-disc text-sm text-gray-700">
+                {profile.prior_treatments.map((t) => (
+                  <li key={t}>{t}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {Array.isArray(profile.comorbidities) && profile.comorbidities.length > 0 && (
+            <div>
+              <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
+                Comorbidities
+              </p>
+              <ul className="list-inside list-disc text-sm text-gray-700">
+                {profile.comorbidities.map((c) => (
+                  <li key={c}>{c}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <p className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            {profile.discuss_with_oncologist}
           </p>
-          <ul className="list-inside list-disc text-sm text-gray-700">
-            {profile.prior_treatments.map((t) => (
-              <li key={t}>{t}</li>
-            ))}
-          </ul>
-        </div>
+        </>
       )}
-      {Array.isArray(profile.comorbidities) && profile.comorbidities.length > 0 && (
-        <div>
-          <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
-            Comorbidities
-          </p>
-          <ul className="list-inside list-disc text-sm text-gray-700">
-            {profile.comorbidities.map((c) => (
-              <li key={c}>{c}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-      <p className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-        {profile.discuss_with_oncologist}
-      </p>
     </div>
   );
 }

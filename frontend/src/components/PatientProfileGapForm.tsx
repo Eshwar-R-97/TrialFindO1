@@ -6,6 +6,7 @@ import type { PatientProfileExtracted } from "../types";
 export interface PatientProfileGapFormProps {
   current: PatientProfileExtracted;
   onSave: (patch: Record<string, string | number | string[]>) => Promise<void>;
+  onSaved?: () => void;
 }
 
 // ── Field definitions ─────────────────────────────────────────────────────────
@@ -130,14 +131,31 @@ function getEmptyKeys(profile: PatientProfileExtracted): Set<string> {
 
 // ── Main component ────────────────────────────────────────────────────────────
 
-export function PatientProfileGapForm({ current, onSave }: PatientProfileGapFormProps) {
+export function PatientProfileGapForm({ current, onSave, onSaved }: PatientProfileGapFormProps) {
   const emptyKeys = useMemo(() => getEmptyKeys(current), [current]);
+  const [dismissed, setDismissed] = useState(false);
 
-  // If nothing is missing, don't render
+  const handleSaved = useCallback(() => {
+    setDismissed(true);
+    onSaved?.();
+  }, [onSaved]);
+
   const hasAnyMissing = emptyKeys.size > 0;
-  if (!hasAnyMissing) return null;
+  const show = hasAnyMissing && !dismissed;
 
-  return <GapFormInner emptyKeys={emptyKeys} current={current} onSave={onSave} />;
+  return (
+    <AnimatePresence>
+      {show && (
+        <GapFormInner
+          key="gap-form"
+          emptyKeys={emptyKeys}
+          current={current}
+          onSave={onSave}
+          onSaved={handleSaved}
+        />
+      )}
+    </AnimatePresence>
+  );
 }
 
 // Separate inner component so state resets when current changes
@@ -145,10 +163,12 @@ function GapFormInner({
   emptyKeys,
   current,
   onSave,
+  onSaved,
 }: {
   emptyKeys: Set<string>;
   current: PatientProfileExtracted;
   onSave: PatientProfileGapFormProps["onSave"];
+  onSaved?: () => void;
 }) {
   // Text state for simple fields
   const [values, setValues] = useState<Record<string, string>>(() => {
@@ -215,20 +235,17 @@ function GapFormInner({
   const submit = useCallback(async () => {
     setError(null);
     const patch = buildPatch();
-    if (patch === null) return; // validation error already set
-    if (Object.keys(patch).length === 0) {
-      // Nothing filled in — that's allowed; just save the consent
-      return;
-    }
+    if (patch === null) return;
     setSaving(true);
     try {
-      await onSave(patch);
+      if (Object.keys(patch).length > 0) await onSave(patch);
+      onSaved?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }
-  }, [buildPatch, onSave]);
+  }, [buildPatch, onSave, onSaved]);
 
   const visibleGroups = FIELD_GROUPS.map((g) => ({
     ...g,
@@ -239,6 +256,7 @@ function GapFormInner({
     <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -8, transition: { duration: 0.25 } }}
       transition={{ duration: 0.35 }}
       className="overflow-hidden rounded-2xl border border-brand-100 bg-white shadow-sm"
     >
