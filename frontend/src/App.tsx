@@ -113,7 +113,7 @@ export default function App() {
 
       {/* ── TOOL AREA ── */}
       <section className="bg-white px-4 pb-20 pt-10 sm:px-6 lg:px-8">
-        <div className="mx-auto max-w-[900px] space-y-5">
+        <div className="mx-auto max-w-[1280px] space-y-5">
           {/* Upload card — always visible */}
           <motion.div
             initial={{ opacity: 0, y: 20 }}
@@ -136,10 +136,7 @@ export default function App() {
               >
                 <motion.div variants={revealUp}>
                   <HeroCard
-                    statusText={stream.statusText}
                     errors={stream.errors}
-                    elapsedMs={stream.elapsedMs}
-                    running={stream.running}
                     patientProfile={pdfPatient}
                   />
                 </motion.div>
