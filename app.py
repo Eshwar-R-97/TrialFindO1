@@ -409,6 +409,26 @@ FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 # worker pool to this value so we don't get 429s. Override via env var if
 # your plan allows more.
 FEATHERLESS_MAX_CONCURRENCY = int(os.getenv("FEATHERLESS_MAX_CONCURRENCY", "4"))
+# Set to 0/false/no to skip the extra Featherless calls that rewrite log lines
+# into patient-friendly one-liners — slightly faster and fewer 429s on small plans.
+FEATHERLESS_FRIENDLY_STATUS = os.getenv("FEATHERLESS_FRIENDLY_STATUS", "1")
+# PDF profile extraction can use a smaller/faster model than trial scoring.
+# Defaults to FEATHERLESS_MODEL when unset.
+# Example: same 8B instruct or a lighter endpoint your plan exposes.
+FEATHERLESS_PDF_MODEL = os.getenv("FEATHERLESS_PDF_MODEL", "").strip() or None
+# Completion budget for the structured patient JSON (smaller = faster generation).
+FEATHERLESS_PDF_MAX_TOKENS = int(os.getenv("FEATHERLESS_PDF_MAX_TOKENS", "900"))
+# Per-request timeout for Featherless HTTP calls (seconds).
+FEATHERLESS_HTTP_TIMEOUT = float(os.getenv("FEATHERLESS_HTTP_TIMEOUT", "120"))
+
+
+def _featherless_pdf_api_key() -> str:
+    """Key for PDF → patient profile calls. Use a dedicated key if set, else main key."""
+    pdf = (os.getenv("FEATHERLESS_PDF_API_KEY") or "").strip()
+    if pdf:
+        return pdf
+    return (os.getenv("FEATHERLESS_API_KEY") or "").strip()
+
 
 # How many Mayo Clinic detail pages to scrape in parallel. We launch one
 # Tinyfish browser agent per URL. The default is 2 because Tinyfish plans
@@ -1092,16 +1112,10 @@ def parse_tinyfish_result(raw_result: Any) -> List[Dict[str, Any]]:
     if isinstance(raw_result, str):
         cleaned = raw_result.strip()
         try:
-            parsed = json.loads(cleaned)
+            parsed = _json_decode_first_value(cleaned)
             return parse_tinyfish_result(parsed)
-        except json.JSONDecodeError:
-            match = re.search(r"(\[.*\])", cleaned, re.DOTALL)
-            if match:
-                try:
-                    parsed = json.loads(match.group(1))
-                    return parse_tinyfish_result(parsed)
-                except json.JSONDecodeError:
-                    return []
+        except ValueError:
+            return []
     return []
 
 
@@ -1287,16 +1301,9 @@ def _parse_mayo_detail_blob(raw: Any) -> Dict[str, Any]:
     """Turn a detail agent's raw result into a plain dict with our fields."""
     if isinstance(raw, str):
         try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                try:
-                    raw = json.loads(match.group(0))
-                except json.JSONDecodeError:
-                    return {}
-            else:
-                return {}
+            raw = _json_decode_first_value(raw)
+        except ValueError:
+            return {}
     if isinstance(raw, list):
         # Some SDK paths wrap a single object in a single-element array.
         raw = raw[0] if raw else {}
@@ -1693,18 +1700,48 @@ Return ONE JSON object. No extra keys. No markdown fences.
 """
 
 
+def _strip_markdown_json_fence(text: str) -> str:
+    """Remove ``` / ```json wrappers if the model wrapped JSON in a fence."""
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    lines = t.splitlines()
+    if not lines:
+        return t
+    # Drop opening ``` or ```json
+    body: List[str] = []
+    for line in lines[1:]:
+        if line.strip().startswith("```"):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _json_decode_first_value(text: str) -> Any:
+    """Decode the first JSON value in `text`, ignoring trailing prose (fixes 'Extra data')."""
+    t = _strip_markdown_json_fence(text)
+    if not t:
+        raise ValueError("Empty model response.")
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(t):
+        if ch not in "{[":
+            continue
+        try:
+            val, _end = decoder.raw_decode(t, i)
+            return val
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("No JSON value found in model response.")
+
+
 def _extract_json_object(text: str) -> Dict[str, Any]:
     """Pull the first well-formed JSON object out of a model response."""
-    text = text.strip()
-    if text.startswith("{"):
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if match:
-        return json.loads(match.group(0))
-    raise ValueError("No JSON object found in Featherless response.")
+    val = _json_decode_first_value(text)
+    if isinstance(val, list) and len(val) == 1 and isinstance(val[0], dict):
+        val = val[0]
+    if not isinstance(val, dict):
+        raise ValueError("Model response JSON was not an object.")
+    return val
 
 
 # --- PDF upload → pypdf JSON → Featherless patient profile (pathology / AVS) ---
@@ -1714,10 +1751,10 @@ MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MAX_PDF_JSON_CHARS = 16000
 
 DOCUMENT_READ_SYSTEM_PROMPT = (
-    "You receive a JSON object created by extracting text from a patient's medical "
-    "PDF using pypdf. It has `format`, `page_count`, and `pages`: an array of "
-    "{page_index, text} for each page. The same content may appear in `full_text` "
-    "when present — use whichever is easier to read.\n\n"
+    "You receive JSON built from a patient's medical PDF (pypdf text extraction). "
+    "It always has `format` and `page_count`. The text is in `full_text` (one "
+    "string, preferred when present) **or** in `pages`: an array of "
+    "{page_index, text} per page — use whichever fields you are given.\n\n"
     "You are not a doctor. This is not a diagnosis. Your job is to infer a "
     "**trial-matching patient profile** from the document text only.\n\n"
     "Return ONE JSON object with EXACTLY these keys:\n"
@@ -1761,21 +1798,65 @@ def pdf_bytes_to_structured_json(data: bytes) -> Dict[str, Any]:
     }
 
 
-def _shrink_structured_pdf_for_model(doc: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
-    """Copy `doc` so json.dumps fits in max_chars by dropping full_text then trimming pages."""
+def _json_compact(obj: Any) -> str:
+    """Compact JSON for fewer input tokens and smaller payloads."""
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_extracted_pdf_text(text: str) -> str:
+    """Collapse noisy whitespace so more clinical text fits under the char cap."""
+    if not text:
+        return ""
+    t = text.replace("\x00", " ").strip()
+    t = re.sub(r"\r\n?", "\n", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{4,}", "\n\n\n", t)
+    return t.strip()
+
+
+def _build_pdf_payload_for_model(doc: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
+    """Prefer a single `full_text` blob (less token overhead than per-page JSON).
+
+    If that does not fit `max_chars`, fall back to a normalized `pages` array and
+    trim from the last page until the payload fits.
+    """
     import copy
 
-    d = copy.deepcopy(doc)
-    while True:
-        payload = json.dumps(d, ensure_ascii=False)
-        if len(payload) <= max_chars:
-            return d
-        if d.get("full_text"):
-            d["full_text"] = ""
-            continue
+    fmt = doc.get("format", "pypdf_extract_v1")
+    pages_in = doc.get("pages") or []
+    full_raw = (doc.get("full_text") or "").strip()
+    full_norm = _normalize_extracted_pdf_text(full_raw) if full_raw else ""
+    if not full_norm and pages_in:
+        full_norm = _normalize_extracted_pdf_text(
+            "\n\n".join((p.get("text") or "").strip() for p in pages_in)
+        )
+
+    pages_copy: List[Dict[str, Any]] = []
+    for p in pages_in:
+        txt = _normalize_extracted_pdf_text((p.get("text") or ""))
+        pages_copy.append(
+            {"page_index": p.get("page_index", len(pages_copy) + 1), "text": txt}
+        )
+
+    def size(obj: Any) -> int:
+        return len(_json_compact(obj))
+
+    only_full: Dict[str, Any] = {
+        "format": fmt,
+        "page_count": len(pages_copy) if pages_copy else (doc.get("page_count") or 0),
+        "full_text": full_norm,
+    }
+    if size(only_full) <= max_chars:
+        return only_full
+
+    d: Dict[str, Any] = {
+        "format": fmt,
+        "page_count": len(pages_copy),
+        "pages": copy.deepcopy(pages_copy),
+    }
+    while size(d) > max_chars:
         pages = d.get("pages") or []
         if not pages:
-            # Hard truncate last resort: empty document
             d["pages"] = []
             d["page_count"] = 0
             return d
@@ -1787,28 +1868,39 @@ def _shrink_structured_pdf_for_model(doc: Dict[str, Any], max_chars: int) -> Dic
             pages.pop()
             d["page_count"] = len(pages)
 
+    return d
+
 
 def featherless_read_prepared_pdf_dict(for_model: Dict[str, Any]) -> Dict[str, Any]:
     """Send already-shrunk pypdf JSON to Featherless; return patient profile fields."""
-    api_key = os.getenv("FEATHERLESS_API_KEY")
+    api_key = _featherless_pdf_api_key()
     if not api_key:
-        raise RuntimeError("FEATHERLESS_API_KEY not configured")
-    client = OpenAI(api_key=api_key, base_url=FEATHERLESS_BASE_URL)
-    user_body = json.dumps(for_model, ensure_ascii=False, indent=2)
+        raise RuntimeError(
+            "Featherless API key not configured "
+            "(set FEATHERLESS_PDF_API_KEY or FEATHERLESS_API_KEY)"
+        )
+    model = FEATHERLESS_PDF_MODEL or FEATHERLESS_MODEL
+    client = OpenAI(
+        api_key=api_key,
+        base_url=FEATHERLESS_BASE_URL,
+        timeout=FEATHERLESS_HTTP_TIMEOUT,
+    )
+    user_body = _json_compact(for_model)
     completion = client.chat.completions.create(
-        model=FEATHERLESS_MODEL,
+        model=model,
         temperature=0,
-        max_tokens=1400,
+        max_tokens=FEATHERLESS_PDF_MAX_TOKENS,
         messages=[
             {"role": "system", "content": DOCUMENT_READ_SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
-                    "Parse this PDF extraction JSON and produce the patient profile JSON.\n\n"
+                    "Parse this PDF extraction JSON and produce the patient profile JSON.\n"
                     f"{user_body}"
                 ),
             },
         ],
+        timeout=FEATHERLESS_HTTP_TIMEOUT,
     )
     raw_text = completion.choices[0].message.content or ""
     return _extract_json_object(raw_text)
@@ -1816,7 +1908,7 @@ def featherless_read_prepared_pdf_dict(for_model: Dict[str, Any]) -> Dict[str, A
 
 def featherless_read_document(structured_pdf: Dict[str, Any]) -> Dict[str, Any]:
     """Shrink pypdf output to context limits, then call Featherless."""
-    for_model = _shrink_structured_pdf_for_model(structured_pdf, MAX_PDF_JSON_CHARS)
+    for_model = _build_pdf_payload_for_model(structured_pdf, MAX_PDF_JSON_CHARS)
     return featherless_read_prepared_pdf_dict(for_model)
 
 
@@ -2173,8 +2265,15 @@ def api_read_pdf() -> Response:
 
 
 def _api_read_pdf_impl() -> Response:
-    if not os.getenv("FEATHERLESS_API_KEY"):
-        return jsonify({"error": "FEATHERLESS_API_KEY not configured"}), 503
+    if not _featherless_pdf_api_key():
+        return jsonify(
+            {
+                "error": (
+                    "Featherless API key not configured. "
+                    "Set FEATHERLESS_PDF_API_KEY (PDF upload) and/or FEATHERLESS_API_KEY."
+                )
+            }
+        ), 503
     if "file" not in request.files:
         return jsonify({"error": "Missing file field (use multipart name=file)."}), 400
     upload = request.files["file"]
@@ -2205,8 +2304,8 @@ def _api_read_pdf_impl() -> Response:
             }
         ), 400
     raw_json_len = len(json.dumps(structured, ensure_ascii=False))
-    for_model = _shrink_structured_pdf_for_model(structured, MAX_PDF_JSON_CHARS)
-    json_chars = len(json.dumps(for_model, ensure_ascii=False))
+    for_model = _build_pdf_payload_for_model(structured, MAX_PDF_JSON_CHARS)
+    json_chars = len(_json_compact(for_model))
     try:
         extracted_profile = featherless_read_prepared_pdf_dict(for_model)
     except ValueError as exc:
@@ -2291,7 +2390,8 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     # automatically fan out a technical log AND a friendly one-liner.
     featherless_key = os.getenv("FEATHERLESS_API_KEY")
     translator: Optional[FriendlyTranslator] = None
-    if featherless_key:
+    _fs = (FEATHERLESS_FRIENDLY_STATUS or "").strip().lower()
+    if featherless_key and _fs not in ("0", "false", "no", "off"):
         translator = FriendlyTranslator(
             featherless_key, FEATHERLESS_MODEL, reporter
         )
