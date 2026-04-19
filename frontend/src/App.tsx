@@ -1,7 +1,5 @@
 import { Header } from "./components/Header";
 import { HeroCard } from "./components/HeroCard";
-import { PipelinePanel } from "./components/PipelinePanel";
-import { RawTrialsPanel } from "./components/RawTrialsPanel";
 import { ScoredMatchesTable } from "./components/ScoredMatchesTable";
 import { StatusTicker } from "./components/StatusTicker";
 import { useTrialStream } from "./hooks/useTrialStream";
@@ -21,8 +19,6 @@ export default function App() {
           running={stream.running}
         />
 
-        <PipelinePanel steps={stream.steps} />
-
         <StatusTicker
           friendlyStatus={stream.friendlyStatus}
           running={stream.running}
@@ -30,9 +26,11 @@ export default function App() {
           scoredCount={stream.scored.length}
         />
 
-        <ScoredMatchesTable scored={stream.scored} running={stream.running} />
-
-        <RawTrialsPanel rawTrials={stream.rawTrials} />
+        <ScoredMatchesTable
+          rawTrials={stream.rawTrials}
+          scored={stream.scored}
+          running={stream.running}
+        />
 
         <footer className="pt-4 text-center text-xs text-muted-foreground">
           <p>

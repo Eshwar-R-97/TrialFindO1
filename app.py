@@ -3,9 +3,9 @@ import os
 import random
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -29,6 +29,12 @@ class Reporter:
         # lines into patient-friendly one-liners. Set by `_run_pipeline` once
         # the Featherless key is confirmed available. `None` means no-op.
         self.translator: "Optional[FriendlyTranslator]" = None
+        # Optional per-trial async scorer. When set, every trial emitted via
+        # `reporter.trial(...)` is handed to it immediately and scored in
+        # parallel on a background thread pool — so scoring overlaps with
+        # the remaining fetch steps instead of being a separate terminal
+        # stage. The scorer also owns NCT-id dedupe (see `TrialScorer`).
+        self.scorer: "Optional[TrialScorer]" = None
 
     def _emit(self, event: Dict[str, Any]) -> None:
         event.setdefault("ts", time.time())
@@ -81,7 +87,16 @@ class Reporter:
         )
 
     def trial(self, trial: Dict[str, Any]) -> None:
-        """Emit a single raw trial as soon as it's normalized."""
+        """Emit a single raw trial as soon as it's normalized.
+
+        If a `TrialScorer` is attached we first hand the trial to it — that
+        both dedupes by NCT id and kicks off an async scoring job. Only
+        first-time-seen trials make it onto the SSE stream, so the UI never
+        sees the same study twice across overlapping sources.
+        """
+        if self.scorer is not None:
+            if not self.scorer.schedule(trial):
+                return
         self._emit({"type": "trial_added", "trial": trial})
 
     def scored(self, entry: Dict[str, Any]) -> None:
@@ -1402,157 +1417,189 @@ def _fallback_score(trial_index: int, reason: str) -> Dict[str, Any]:
     }
 
 
-def score_trials_with_featherless(
-    trials: List[Dict[str, Any]], reporter: Reporter
-) -> List[Dict[str, Any]]:
-    """Score all trials in parallel, emitting each result the moment it lands.
+class TrialScorer:
+    """Async per-trial scoring pipeline.
 
-    One Featherless chat completion is issued per trial. Each request runs in
-    its own worker thread, so total Step-3 wall time is roughly the latency
-    of the slowest single request (instead of the sum of all of them).
+    As soon as a fetch step normalizes a trial it is handed to this scorer,
+    which:
+      1. Dedupes by NCT id so ClinicalTrials.gov / NCI overlap never gets
+         scored (or shown) twice.
+      2. Assigns a stable monotonic `trial_index` to each accepted trial.
+      3. Submits a scoring job to a shared `ThreadPoolExecutor` sized to
+         the Featherless plan's concurrency cap.
+      4. Emits `scored_added` to the Reporter the instant each score lands.
+
+    This means scoring overlaps with Steps 1-3 instead of being a separate
+    terminal stage — the first trial starts getting scored while the Mayo
+    browser-agent scrape is still running.
     """
-    reporter.step(
-        4,
-        "running",
-        f"Scoring {len(trials)} trial(s) with Featherless AI in parallel...",
-        title="Featherless AI scoring",
-    )
-    reporter.translate(
-        f"Our AI is now reviewing all {len(trials)} trials to see which ones fit you best.",
-        step=4,
-    )
 
-    if not trials:
-        reporter.step(
-            4, "complete", "No trials to score.", title="Featherless AI scoring"
+    def __init__(self, reporter: "Reporter", max_workers: int) -> None:
+        self._reporter = reporter
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, max_workers),
+            thread_name_prefix="scorer",
         )
-        return []
+        self._lock = Lock()
+        self._seen_nct: set = set()
+        self._trials: List[Dict[str, Any]] = []  # in scheduling order
+        self._futures: List[Future] = []
+        self._scores: Dict[int, Dict[str, Any]] = {}
+        self._submitted = 0
+        self._completed = 0
+        self._started_step4 = False
 
-    api_key = os.getenv("FEATHERLESS_API_KEY")
-    if not api_key:
-        raise RuntimeError("FEATHERLESS_API_KEY is missing.")
+        api_key = os.getenv("FEATHERLESS_API_KEY")
+        if api_key:
+            # Shared OpenAI client — thread-safe connection pool under httpx.
+            self._client: Optional[OpenAI] = OpenAI(
+                api_key=api_key, base_url=FEATHERLESS_BASE_URL
+            )
+        else:
+            self._client = None
+            self._reporter.log(
+                "FEATHERLESS_API_KEY missing — per-trial scoring disabled.",
+                step=4,
+            )
 
-    # The OpenAI Python client is safe to share across threads — it wraps
-    # httpx.Client, which uses a thread-safe connection pool.
-    client = OpenAI(api_key=api_key, base_url=FEATHERLESS_BASE_URL)
+    # ── public API ─────────────────────────────────────────────────────
 
-    # Cap parallelism to the Featherless plan's concurrency limit. Firing
-    # more requests than the plan allows just wastes retries on 429 errors.
-    max_workers = min(len(trials), max(1, FEATHERLESS_MAX_CONCURRENCY))
-    reporter.log(
-        f"Dispatching {len(trials)} scoring request(s) to "
-        f"{FEATHERLESS_MODEL} (max_workers={max_workers}, "
-        f"plan cap={FEATHERLESS_MAX_CONCURRENCY}).",
-        step=4,
-    )
+    def schedule(self, trial: Dict[str, Any]) -> bool:
+        """Queue `trial` for scoring. Returns False if it's a duplicate."""
+        nct = (trial.get("nct_id") or "").strip().upper()
+        with self._lock:
+            if nct and nct in self._seen_nct:
+                return False
+            if nct:
+                self._seen_nct.add(nct)
+            idx = len(self._trials)
+            self._trials.append(trial)
+            self._submitted += 1
+            in_flight = self._submitted - self._completed
 
-    scores: List[Optional[Dict[str, Any]]] = [None] * len(trials)
-    completed = 0
-    t0 = time.time()
+        if not self._started_step4:
+            self._started_step4 = True
+            self._reporter.step(
+                4,
+                "running",
+                "Scoring trials as they arrive…",
+                title="Featherless AI scoring",
+            )
 
-    def _run_one(idx: int, trial: Dict[str, Any]) -> Dict[str, Any]:
+        title_short = (trial.get("title") or "Untitled")[:60]
+        self._reporter.log(
+            f"Queued trial {idx + 1} for scoring: {title_short}… "
+            f"({in_flight} in flight)",
+            step=4,
+        )
+        self._reporter.step(
+            4,
+            "running",
+            f"{self._completed}/{self._submitted} scored "
+            f"({in_flight} in flight)…",
+            title="Featherless AI scoring",
+        )
+
+        if self._client is None:
+            # No key — fabricate a failure score so the UI still renders a row.
+            score = _fallback_score(idx, "FEATHERLESS_API_KEY missing")
+            self._finalize(idx, trial, score, elapsed_ms=0)
+            return True
+
+        future = self._executor.submit(self._score_and_emit, idx, trial)
+        with self._lock:
+            self._futures.append(future)
+        return True
+
+    def wait(self) -> List[Dict[str, Any]]:
+        """Block until every scheduled scoring job completes, then return
+        the merged `{trial, score}` entries in scheduling order."""
+        # Snapshot futures under lock so a late-scheduled trial is still
+        # waited on correctly.
+        while True:
+            with self._lock:
+                pending = [f for f in self._futures if not f.done()]
+            if not pending:
+                break
+            for fut in pending:
+                try:
+                    fut.result()
+                except Exception as exc:
+                    self._reporter.log(f"Scoring future raised: {exc}", step=4)
+
+        self._executor.shutdown(wait=True)
+
+        out: List[Dict[str, Any]] = []
+        with self._lock:
+            for idx, trial in enumerate(self._trials):
+                score = self._scores.get(idx) or _fallback_score(idx, "missing")
+                out.append({"trial": trial, "score": score})
+        return out
+
+    @property
+    def trials(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._trials)
+
+    @property
+    def submitted(self) -> int:
+        return self._submitted
+
+    @property
+    def completed(self) -> int:
+        return self._completed
+
+    # ── internals ──────────────────────────────────────────────────────
+
+    def _score_and_emit(self, idx: int, trial: Dict[str, Any]) -> None:
         start = time.time()
         try:
-            score = _score_single_trial(client, trial, idx, reporter)
+            score = _score_single_trial(self._client, trial, idx, self._reporter)
         except Exception as exc:
-            reporter.log(
+            self._reporter.log(
                 f"Trial {idx + 1} permanently failed after retries: {exc}",
                 step=4,
             )
             score = _fallback_score(idx, str(exc))
-
         elapsed_ms = int((time.time() - start) * 1000)
-        reporter.log(
-            f"Trial {idx + 1} scored "
-            f"({score.get('match_score', '—')} / {score.get('match_level', '—')}) "
-            f"in {elapsed_ms} ms.",
+        self._finalize(idx, trial, score, elapsed_ms=elapsed_ms)
+
+    def _finalize(
+        self,
+        idx: int,
+        trial: Dict[str, Any],
+        score: Dict[str, Any],
+        elapsed_ms: int,
+    ) -> None:
+        with self._lock:
+            self._scores[idx] = score
+            self._completed += 1
+            completed = self._completed
+            submitted = self._submitted
+            in_flight = submitted - completed
+
+        level = score.get("match_level") or "—"
+        match_score = score.get("match_score")
+        self._reporter.log(
+            f"Trial {idx + 1} scored ({match_score if match_score is not None else '—'}"
+            f" / {level}) in {elapsed_ms} ms.",
             step=4,
         )
         trial_title = (trial.get("title") or "Untitled")[:120]
-        level = score.get("match_level") or "unknown"
-        reporter.translate(
+        self._reporter.translate(
             f"Finished reviewing '{trial_title}' — rated a {level} match for you.",
             step=4,
         )
-        return score
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        future_to_idx = {
-            pool.submit(_run_one, idx, trial): idx
-            for idx, trial in enumerate(trials)
-        }
+        # Stream the merged entry the instant the score lands.
+        self._reporter.scored({"trial": trial, "score": score})
 
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            score = future.result()  # _run_one never raises; exceptions become fallbacks
-            scores[idx] = score
-
-            # Stream this one merged entry to the UI the instant it's ready,
-            # so users see the table fill in as each parallel agent finishes.
-            entry = {"trial": trials[idx], "score": score}
-            reporter.scored(entry)
-
-            completed += 1
-            reporter.step(
-                4,
-                "running",
-                f"Scored {completed}/{len(trials)} trial(s) in parallel…",
-                title="Featherless AI scoring",
-            )
-
-    total_elapsed_ms = int((time.time() - t0) * 1000)
-    reporter.log(
-        f"All {len(trials)} trial(s) scored in {total_elapsed_ms} ms total "
-        f"(parallel, max_workers={max_workers}).",
-        step=4,
-    )
-    reporter.step(
-        4,
-        "complete",
-        f"Scored {len(trials)} trial(s) in parallel.",
-        title="Featherless AI scoring",
-    )
-    reporter.translate(
-        f"AI finished reviewing all {len(trials)} trial(s) — your matches are ranked.",
-        step=4,
-    )
-
-    # Return in input-order so merge_trials_with_scores (and anything
-    # downstream) sees a stable shape regardless of completion order.
-    return [s if s is not None else _fallback_score(i, "missing") for i, s in enumerate(scores)]
-
-
-def merge_trials_with_scores(
-    raw_trials: List[Dict[str, Any]], scores: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    by_index = {}
-    for score in scores:
-        try:
-            idx = int(score.get("trial_index"))
-        except (TypeError, ValueError):
-            continue
-        by_index[idx] = score
-
-    merged = []
-    for idx, trial in enumerate(raw_trials):
-        merged.append(
-            {
-                "trial": trial,
-                "score": by_index.get(
-                    idx,
-                    {
-                        "trial_index": idx,
-                        "match_score": None,
-                        "match_level": "low",
-                        "rationale": "No score available.",
-                        "key_eligibility_factors": [],
-                        "potential_exclusions": [],
-                        "plain_english_summary": "Scoring unavailable for this trial.",
-                    },
-                ),
-            }
+        self._reporter.step(
+            4,
+            "running",
+            f"{completed}/{submitted} scored ({in_flight} in flight)…",
+            title="Featherless AI scoring",
         )
-    return merged
 
 
 def _serve_index() -> Response:
@@ -1592,32 +1639,6 @@ def spa_fallback(path: str) -> Response:
     return _serve_index()
 
 
-def _dedupe_trials_by_nct_id(
-    trials: List[Dict[str, Any]], reporter: Reporter
-) -> List[Dict[str, Any]]:
-    """Collapse duplicate studies across sources by their NCT id.
-
-    When two sources return the same NCT id (common for ClinicalTrials.gov
-    and NCI CTRP) we keep the first occurrence — earlier sources (ctgov)
-    already have patient-location-aware site selection — and drop the
-    duplicates. Trials without an nct_id (e.g. Mayo rows) are always kept.
-    """
-    seen: set = set()
-    out: List[Dict[str, Any]] = []
-    dropped = 0
-    for trial in trials:
-        nct = (trial.get("nct_id") or "").strip().upper()
-        if nct:
-            if nct in seen:
-                dropped += 1
-                continue
-            seen.add(nct)
-        out.append(trial)
-    if dropped:
-        reporter.log(f"De-duplicated {dropped} overlapping trial(s) by NCT id.")
-    return out
-
-
 def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     started = time.time()
     errors: List[str] = []
@@ -1630,7 +1651,12 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     reporter.step(1, "pending", "Idle.", title="ClinicalTrials.gov API")
     reporter.step(2, "pending", "Idle.", title="NCI Cancer.gov API")
     reporter.step(3, "pending", "Idle.", title="Mayo Clinic browser agent (Tinyfish)")
-    reporter.step(4, "pending", "Idle.", title="Featherless AI scoring")
+    reporter.step(
+        4,
+        "pending",
+        "Will score each trial as soon as it arrives.",
+        title="Featherless AI scoring",
+    )
 
     # Spin up the patient-friendly translator for this pipeline run. We hand
     # it to the reporter so any `reporter.milestone(...)` calls downstream
@@ -1649,6 +1675,14 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     )
 
     prewarm_featherless(reporter)
+
+    # Stand the async per-trial scorer up BEFORE any fetch step runs, and
+    # attach it to the reporter. From this point on, every `reporter.trial()`
+    # call (inside each fetch function) immediately hands the trial off to
+    # the scorer, which scores it on a background thread — overlapping
+    # scoring with the remaining fetch work.
+    scorer = TrialScorer(reporter, max_workers=FEATHERLESS_MAX_CONCURRENCY)
+    reporter.scorer = scorer
 
     try:
         clinical_trials = fetch_clinical_trials(reporter)
@@ -1674,28 +1708,42 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         reporter.log(msg, step=3)
         reporter.step(3, "error", str(exc), title="Mayo Clinic browser agent (Tinyfish)")
 
-    combined = clinical_trials + nci_trials + mayo_trials
-    raw_trials = _dedupe_trials_by_nct_id(combined, reporter)
+    # All fetch sources done — raw_trials is the deduped, schedule-ordered
+    # list that the scorer already owns.
+    raw_trials = scorer.trials
     reporter.milestone(
         f"Gathered {len(raw_trials)} unique trial(s) across all three sources — "
-        f"getting ready to check which fit you best."
+        f"waiting on the last few scoring jobs to finish."
     )
 
-    if raw_trials:
-        try:
-            # score_trials_with_featherless() dispatches one parallel request
-            # per trial and emits `scored_added` events to the Reporter the
-            # moment each one lands, so we don't re-emit here.
-            scores = score_trials_with_featherless(raw_trials, reporter)
-            scored_trials = merge_trials_with_scores(raw_trials, scores)
-        except Exception as exc:
-            msg = f"Step 4 failed: {exc}"
-            errors.append(msg)
-            reporter.log(msg, step=4)
-            reporter.step(4, "error", str(exc), title="Featherless AI scoring")
-            scored_trials = []
-    else:
+    if scorer.submitted == 0:
         reporter.step(4, "error", "No trials to score.", title="Featherless AI scoring")
+        scored_trials = []
+    else:
+        if scorer.completed < scorer.submitted:
+            reporter.step(
+                4,
+                "running",
+                f"Waiting for the last {scorer.submitted - scorer.completed} "
+                f"trial(s) to finish scoring…",
+                title="Featherless AI scoring",
+            )
+        scored_trials = scorer.wait()
+        reporter.step(
+            4,
+            "complete",
+            f"Scored {len(scored_trials)} trial(s) in parallel as they arrived.",
+            title="Featherless AI scoring",
+        )
+        reporter.translate(
+            f"AI finished reviewing all {len(scored_trials)} trial(s) — "
+            f"your matches are ranked.",
+            step=4,
+        )
+
+    # Detach the scorer — downstream consumers of the final result payload
+    # should not keep a handle into it.
+    reporter.scorer = None
 
     elapsed_ms = int((time.time() - started) * 1000)
     reporter.milestone(
