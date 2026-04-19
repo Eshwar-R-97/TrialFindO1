@@ -130,3 +130,46 @@ export type SSEEvent =
   | FriendlyStatusEvent
   | ResultEvent
   | DoneEvent;
+
+/** Patient profile for trial matching (from Featherless parsing pypdf JSON). */
+export interface PatientProfileExtracted {
+  summary: string;
+  first_name: string | null;
+  last_name: string | null;
+  email: string | null;
+  age: number | null;
+  zip_code: string | null;
+  diagnosis: string | null;
+  cancer_type: string | null;
+  stage: string | null;
+  biomarkers: Record<string, string>;
+  prior_treatments: string[];
+  performance_status: string | null;
+  comorbidities: string[];
+  discuss_with_oncologist: string;
+}
+
+/** @deprecated use PatientProfileExtracted */
+export type ExtractedProfile = PatientProfileExtracted;
+
+/** Safe summary of pypdf output (no raw page text). */
+export interface PdfExtractionSummary {
+  format: string | null;
+  page_count: number;
+  total_text_chars: number;
+  chars_per_page: number[];
+}
+
+export interface ReadPdfMeta {
+  filename: string;
+  bytes: number;
+  text_chars_extracted: number;
+  json_chars_sent_to_model: number;
+  json_truncated_for_model: boolean;
+}
+
+export interface ReadPdfResponse {
+  extracted_profile: PatientProfileExtracted;
+  pdf_extraction: PdfExtractionSummary;
+  meta: ReadPdfMeta;
+}

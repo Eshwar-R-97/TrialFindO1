@@ -16,6 +16,14 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      "/api": {
+        target: "http://localhost:5050",
+        changeOrigin: true,
+        // Featherless can take minutes on large PDFs; default proxy timeouts
+        // otherwise yield empty responses and break res.json().
+        timeout: 300000,
+        proxyTimeout: 300000,
+      },
       "/find-trials": {
         target: "http://localhost:5050",
         changeOrigin: true,

@@ -1,3 +1,4 @@
+import { DocumentUploadCard } from "./components/DocumentUploadCard";
 import { Header } from "./components/Header";
 import { HeroCard } from "./components/HeroCard";
 import { ScoredMatchesTable } from "./components/ScoredMatchesTable";
@@ -12,6 +13,8 @@ export default function App() {
       <Header running={stream.running} onRun={stream.start} />
 
       <main className="mx-auto flex max-w-[1440px] flex-col gap-5 px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+        <DocumentUploadCard />
+
         <HeroCard
           statusText={stream.statusText}
           errors={stream.errors}

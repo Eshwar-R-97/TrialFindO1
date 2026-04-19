@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import random
@@ -10,7 +11,15 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, abort, jsonify, send_from_directory, stream_with_context
+from flask import (
+    Flask,
+    Response,
+    abort,
+    jsonify,
+    request,
+    send_from_directory,
+    stream_with_context,
+)
 from openai import OpenAI
 from tinyfish import TinyFish
 
@@ -1320,6 +1329,130 @@ def _extract_json_object(text: str) -> Dict[str, Any]:
     raise ValueError("No JSON object found in Featherless response.")
 
 
+# --- PDF upload → pypdf JSON → Featherless patient profile (pathology / AVS) ---
+
+MAX_UPLOAD_BYTES = 12 * 1024 * 1024
+# Max serialized JSON size sent to Featherless (pages[].text is truncated to fit).
+MAX_PDF_JSON_CHARS = 16000
+
+DOCUMENT_READ_SYSTEM_PROMPT = (
+    "You receive a JSON object created by extracting text from a patient's medical "
+    "PDF using pypdf. It has `format`, `page_count`, and `pages`: an array of "
+    "{page_index, text} for each page. The same content may appear in `full_text` "
+    "when present — use whichever is easier to read.\n\n"
+    "You are not a doctor. This is not a diagnosis. Your job is to infer a "
+    "**trial-matching patient profile** from the document text only.\n\n"
+    "Return ONE JSON object with EXACTLY these keys:\n"
+    '- summary: string — 2-4 sentences in plain language for the patient.\n'
+    '- first_name: string or null — if clearly labeled (e.g. patient name).\n'
+    '- last_name: string or null — if clearly labeled.\n'
+    '- email: string or null — only if an email appears in the document.\n'
+    '- age: integer or null — only if clearly stated (e.g. age, DOB-derived).\n'
+    '- zip_code: string or null — US ZIP or postal info if present.\n'
+    '- diagnosis: string or null — short clinical diagnosis line if present.\n'
+    '- cancer_type: string or null — normalized: breast, lung, colorectal, etc.\n'
+    '- stage: string or null — Roman numeral or stage description if stated.\n'
+    '- biomarkers: object — string keys and string values, e.g. {"HER2": "positive"}; '
+    "{} if none.\n"
+    '- prior_treatments: array of strings — chemo, surgery, radiation, etc.; [] if none.\n'
+    '- performance_status: string or null — ECOG 0-4 or Karnofsky if mentioned.\n'
+    '- comorbidities: array of strings — other conditions; [] if none.\n'
+    '- discuss_with_oncologist: string — one sentence reminding them to discuss '
+    "this with their oncologist before any trial decisions.\n\n"
+    "If the JSON has no usable medical text, say so in summary and use nulls/empty "
+    "collections elsewhere.\n"
+    "Return JSON only. No markdown fences."
+)
+
+
+def pdf_bytes_to_structured_json(data: bytes) -> Dict[str, Any]:
+    """Extract per-page text with pypdf and return a single JSON-serializable dict."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    pages_out: List[Dict[str, Any]] = []
+    for i, page in enumerate(reader.pages):
+        raw = page.extract_text() or ""
+        pages_out.append({"page_index": i + 1, "text": raw.strip()})
+    full_text = "\n\n".join(p["text"] for p in pages_out if p["text"]).strip()
+    return {
+        "format": "pypdf_extract_v1",
+        "page_count": len(reader.pages),
+        "pages": pages_out,
+        "full_text": full_text,
+    }
+
+
+def _shrink_structured_pdf_for_model(doc: Dict[str, Any], max_chars: int) -> Dict[str, Any]:
+    """Copy `doc` so json.dumps fits in max_chars by dropping full_text then trimming pages."""
+    import copy
+
+    d = copy.deepcopy(doc)
+    while True:
+        payload = json.dumps(d, ensure_ascii=False)
+        if len(payload) <= max_chars:
+            return d
+        if d.get("full_text"):
+            d["full_text"] = ""
+            continue
+        pages = d.get("pages") or []
+        if not pages:
+            # Hard truncate last resort: empty document
+            d["pages"] = []
+            d["page_count"] = 0
+            return d
+        last = pages[-1]
+        txt = last.get("text") or ""
+        if len(txt) > 400:
+            last["text"] = txt[: len(txt) // 2]
+        else:
+            pages.pop()
+            d["page_count"] = len(pages)
+
+
+def featherless_read_prepared_pdf_dict(for_model: Dict[str, Any]) -> Dict[str, Any]:
+    """Send already-shrunk pypdf JSON to Featherless; return patient profile fields."""
+    api_key = os.getenv("FEATHERLESS_API_KEY")
+    if not api_key:
+        raise RuntimeError("FEATHERLESS_API_KEY not configured")
+    client = OpenAI(api_key=api_key, base_url=FEATHERLESS_BASE_URL)
+    user_body = json.dumps(for_model, ensure_ascii=False, indent=2)
+    completion = client.chat.completions.create(
+        model=FEATHERLESS_MODEL,
+        temperature=0,
+        max_tokens=1400,
+        messages=[
+            {"role": "system", "content": DOCUMENT_READ_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Parse this PDF extraction JSON and produce the patient profile JSON.\n\n"
+                    f"{user_body}"
+                ),
+            },
+        ],
+    )
+    raw_text = completion.choices[0].message.content or ""
+    return _extract_json_object(raw_text)
+
+
+def featherless_read_document(structured_pdf: Dict[str, Any]) -> Dict[str, Any]:
+    """Shrink pypdf output to context limits, then call Featherless."""
+    for_model = _shrink_structured_pdf_for_model(structured_pdf, MAX_PDF_JSON_CHARS)
+    return featherless_read_prepared_pdf_dict(for_model)
+
+
+def _pdf_extraction_public_meta(structured: Dict[str, Any]) -> Dict[str, Any]:
+    """Lightweight summary for API clients (no full page text)."""
+    pages = structured.get("pages") or []
+    return {
+        "format": structured.get("format"),
+        "page_count": structured.get("page_count", len(pages)),
+        "total_text_chars": len(structured.get("full_text") or ""),
+        "chars_per_page": [len((p or {}).get("text") or "") for p in pages],
+    }
+
+
 def _is_concurrency_or_rate_limit(exc: Exception) -> bool:
     """Detect Featherless 429 / concurrency-limit responses.
 
@@ -1626,10 +1759,82 @@ def react_assets(filename: str) -> Response:
     return send_from_directory(assets_dir, filename)
 
 
+@app.route("/api/read-pdf", methods=["POST", "OPTIONS"])
+def api_read_pdf() -> Response:
+    """Accept a PDF upload, extract text locally, then interpret via Featherless."""
+    # CORS preflight must hit this route, not the SPA catch-all (which used to 404 api/*).
+    if request.method == "OPTIONS":
+        return Response(status=204)
+    try:
+        return _api_read_pdf_impl()
+    except Exception as exc:
+        # Always return JSON so the SPA never gets an empty body on unexpected errors.
+        print(f"api_read_pdf unexpected error: {exc}", flush=True)
+        return jsonify({"error": f"Server error while reading PDF: {exc}"}), 500
+
+
+def _api_read_pdf_impl() -> Response:
+    if not os.getenv("FEATHERLESS_API_KEY"):
+        return jsonify({"error": "FEATHERLESS_API_KEY not configured"}), 503
+    if "file" not in request.files:
+        return jsonify({"error": "Missing file field (use multipart name=file)."}), 400
+    upload = request.files["file"]
+    if not upload or not upload.filename:
+        return jsonify({"error": "No file selected."}), 400
+    if not upload.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only .pdf files are supported."}), 400
+    data = upload.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        return jsonify({"error": "File too large."}), 413
+    if len(data) == 0:
+        return jsonify({"error": "Empty file."}), 400
+    try:
+        structured = pdf_bytes_to_structured_json(data)
+    except Exception as exc:
+        return jsonify({"error": f"Could not read PDF: {exc}"}), 400
+    full_text = (structured.get("full_text") or "").strip()
+    has_page_text = any(
+        (p.get("text") or "").strip() for p in (structured.get("pages") or [])
+    )
+    if not full_text and not has_page_text:
+        return jsonify(
+            {
+                "error": (
+                    "No text could be extracted. Scanned/image-only PDFs need OCR — "
+                    "try a text-based export from your hospital portal."
+                )
+            }
+        ), 400
+    raw_json_len = len(json.dumps(structured, ensure_ascii=False))
+    for_model = _shrink_structured_pdf_for_model(structured, MAX_PDF_JSON_CHARS)
+    json_chars = len(json.dumps(for_model, ensure_ascii=False))
+    try:
+        extracted_profile = featherless_read_prepared_pdf_dict(for_model)
+    except ValueError as exc:
+        return jsonify({"error": f"Could not parse model response: {exc}"}), 502
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+    return jsonify(
+        {
+            "extracted_profile": extracted_profile,
+            "pdf_extraction": _pdf_extraction_public_meta(structured),
+            "meta": {
+                "filename": upload.filename,
+                "bytes": len(data),
+                "text_chars_extracted": len(full_text) if full_text else sum(
+                    len((p.get("text") or "")) for p in (structured.get("pages") or [])
+                ),
+                "json_chars_sent_to_model": json_chars,
+                "json_truncated_for_model": raw_json_len > MAX_PDF_JSON_CHARS,
+            },
+        }
+    )
+
+
 # SPA fallback: serve real files from dist when they exist, otherwise serve
-# index.html. API routes (find-trials, find-trials-stream) take precedence
-# because they are registered above with more specific rules.
-@app.route("/<path:path>")
+# index.html. GET/HEAD only — do not bind POST/OPTIONS here or uploads and
+# CORS preflights can match this rule and hit `abort(404)` for api/* paths.
+@app.route("/<path:path>", methods=["GET", "HEAD"])
 def spa_fallback(path: str) -> Response:
     if path.startswith(("find-trials", "api/")):
         abort(404)
