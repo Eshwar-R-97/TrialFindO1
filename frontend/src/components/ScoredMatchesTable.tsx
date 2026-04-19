@@ -164,7 +164,7 @@ export function ScoredMatchesTable({ scored, running }: ScoredMatchesTableProps)
       {scored.length === 0 ? (
         <p className="rounded-xl border border-dashed border-border bg-slate-50/60 px-4 py-6 text-center text-sm italic text-muted-foreground">
           {running
-            ? "Scored matches will appear here as soon as Step 3 finishes."
+            ? "Scored matches will appear here as soon as Step 4 finishes."
             : "No scored matches yet. Click Find Trials above to run the pipeline."}
         </p>
       ) : (

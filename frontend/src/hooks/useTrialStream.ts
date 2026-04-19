@@ -10,8 +10,9 @@ import type {
 
 const INITIAL_STEPS: StepState[] = [
   { step: 1, status: "idle", title: "ClinicalTrials.gov API", summary: "Waiting to start." },
-  { step: 2, status: "idle", title: "Mayo Clinic browser agent (Tinyfish)", summary: "Waiting to start." },
-  { step: 3, status: "idle", title: "Featherless AI scoring", summary: "Waiting to start." },
+  { step: 2, status: "idle", title: "NCI Cancer.gov API", summary: "Waiting to start." },
+  { step: 3, status: "idle", title: "Mayo Clinic browser agent (Tinyfish)", summary: "Waiting to start." },
+  { step: 4, status: "idle", title: "Featherless AI scoring", summary: "Waiting to start." },
 ];
 
 function logKind(message: string, step: number | null): LogLine["kind"] {
@@ -22,6 +23,7 @@ function logKind(message: string, step: number | null): LogLine["kind"] {
   if (step === 1) return "step-1";
   if (step === 2) return "step-2";
   if (step === 3) return "step-3";
+  if (step === 4) return "step-4";
   return "system";
 }
 
@@ -66,7 +68,7 @@ export function useTrialStream(): TrialStream {
     setScored([]);
     setElapsedMs(null);
     setErrors([]);
-    setStatusText("Running Step 1 → Step 2 → Step 3 …");
+    setStatusText("Running Step 1 → 2 → 3 → 4 …");
     finalPayloadRef.current = null;
 
     const es = new EventSource("/find-trials-stream");

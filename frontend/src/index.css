@@ -64,6 +64,11 @@ body {
   color: #fdba74;
 }
 
+.log-line.step-4 .step-tag,
+.log-line.step-4 .msg {
+  color: #f9a8d4;
+}
+
 .log-line.error .step-tag,
 .log-line.error .msg {
   color: #fca5a5;

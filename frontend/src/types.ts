@@ -37,13 +37,13 @@ export interface ScoredEntry {
 export type StepStatus = "idle" | "pending" | "running" | "complete" | "error";
 
 export interface StepState {
-  step: 1 | 2 | 3;
+  step: 1 | 2 | 3 | 4;
   status: StepStatus;
   title: string;
   summary: string;
 }
 
-export type LogKind = "step-1" | "step-2" | "step-3" | "error" | "system";
+export type LogKind = "step-1" | "step-2" | "step-3" | "step-4" | "error" | "system";
 
 export interface LogLine {
   id: number;
@@ -62,7 +62,7 @@ export interface LogEvent {
 
 export interface StepUpdateEvent {
   type: "step_update";
-  step: 1 | 2 | 3;
+  step: 1 | 2 | 3 | 4;
   status: StepStatus;
   title?: string;
   summary?: string;

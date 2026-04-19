@@ -109,10 +109,18 @@ FEATHERLESS_MAX_CONCURRENCY = int(os.getenv("FEATHERLESS_MAX_CONCURRENCY", "4"))
 # Bump this in your .env if your plan allows more simultaneous sessions.
 MAYO_MAX_CONCURRENCY = int(os.getenv("MAYO_MAX_CONCURRENCY", "2"))
 
+# NCI Clinical Trials Search (CTRP) API — a second, richer source of
+# federally-registered oncology trials. Unlike ClinicalTrials.gov this one
+# returns per-site phone/email contacts and much more granular eligibility
+# criteria out of the box. Requires a free API key registered at
+# https://clinicaltrialsapi.cancer.gov/ and sent as `x-api-key`.
+NCI_API_URL = "https://clinicaltrialsapi.cancer.gov/api/v2/trials"
+NCI_MAX_RESULTS = int(os.getenv("NCI_MAX_RESULTS", "5"))
+
 
 def prewarm_featherless(reporter: "Reporter") -> None:
     """Fire a tiny request at the Featherless model in a background thread so
-    that by the time Step 3 runs, the model is already resident on GPU and we
+    that by the time Step 4 runs, the model is already resident on GPU and we
     skip the 30-60s cold-start penalty.
 
     Non-blocking; failures are logged but never propagate.
@@ -139,7 +147,7 @@ def prewarm_featherless(reporter: "Reporter") -> None:
                 f"Pre-warm complete in {elapsed_ms} ms — {FEATHERLESS_MODEL} is now hot."
             )
         except Exception as exc:
-            reporter.log(f"Pre-warm failed (non-fatal, Step 3 will still run): {exc}")
+            reporter.log(f"Pre-warm failed (non-fatal, Step 4 will still run): {exc}")
 
     Thread(target=_run, daemon=True).start()
 
@@ -373,6 +381,246 @@ def fetch_clinical_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _pick_best_nci_site(sites: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pick the most patient-relevant NCI site.
+
+    Preference: actively recruiting site in the patient's state, else any
+    site in the patient's state, else any actively recruiting site, else the
+    first site.
+    """
+    if not sites:
+        return {}
+    in_state = [
+        s for s in sites
+        if (s.get("org_state_or_province") or "").strip().upper()
+        in PATIENT_PREFERRED_STATES
+    ]
+    for s in in_state:
+        if (s.get("recruitment_status") or "").upper() == "ACTIVE":
+            return s
+    if in_state:
+        return in_state[0]
+    for s in sites:
+        if (s.get("recruitment_status") or "").upper() == "ACTIVE":
+            return s
+    return sites[0]
+
+
+def _format_nci_location(site: Dict[str, Any]) -> str:
+    parts = [
+        site.get("org_name"),
+        site.get("org_city"),
+        site.get("org_state_or_province"),
+    ]
+    cleaned = [p.strip() for p in parts if isinstance(p, str) and p.strip()]
+    return ", ".join(cleaned) if cleaned else ""
+
+
+def _extract_nci_contacts(
+    trial: Dict[str, Any], best_site: Dict[str, Any]
+) -> List[Dict[str, str]]:
+    """Build the contact list for an NCI trial, preferring site-level phone/email
+    (which is typically populated) over the mostly-empty central_contact.
+    """
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+
+    def _add(entry: Dict[str, str]) -> None:
+        if not entry:
+            return
+        key = (entry.get("name", ""), entry.get("phone", ""), entry.get("email", ""))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(entry)
+
+    central = trial.get("central_contact") or {}
+    if any(central.get(k) for k in ("name", "phone", "email")):
+        _add(
+            {
+                "name": (central.get("name") or "").strip(),
+                "role": "Study contact",
+                "phone": (central.get("phone") or "").strip(),
+                "email": (central.get("email") or "").strip(),
+            }
+        )
+
+    if isinstance(best_site, dict) and best_site:
+        _add(
+            {
+                "name": (best_site.get("contact_name") or best_site.get("org_name") or "").strip(),
+                "role": "Site contact",
+                "phone": (best_site.get("contact_phone") or best_site.get("org_phone") or "").strip(),
+                "email": (best_site.get("contact_email") or best_site.get("org_email") or "").strip(),
+            }
+        )
+
+    pi = trial.get("principal_investigator")
+    if isinstance(pi, str) and pi.strip():
+        _add({"name": pi.strip(), "role": "Principal investigator", "phone": "", "email": ""})
+
+    return [c for c in out if c.get("name") or c.get("phone") or c.get("email")]
+
+
+def _summarize_nci_eligibility(elig: Dict[str, Any]) -> str:
+    """Flatten NCI structured + unstructured eligibility into a readable blob."""
+    if not isinstance(elig, dict):
+        return ""
+    parts: List[str] = []
+    structured = elig.get("structured") or {}
+    if isinstance(structured, dict):
+        pieces = []
+        if structured.get("sex"):
+            pieces.append(f"Sex: {structured['sex']}")
+        min_age = structured.get("min_age") or ""
+        max_age = structured.get("max_age") or ""
+        if min_age or max_age:
+            pieces.append(f"Age: {min_age or '—'} to {max_age or '—'}")
+        if structured.get("accepts_healthy_volunteers") is not None:
+            pieces.append(
+                f"Healthy volunteers: "
+                f"{'yes' if structured['accepts_healthy_volunteers'] else 'no'}"
+            )
+        if pieces:
+            parts.append(" · ".join(pieces))
+
+    for entry in elig.get("unstructured") or []:
+        desc = (entry.get("description") or "").strip()
+        if not desc:
+            continue
+        tag = "Inclusion" if entry.get("inclusion_indicator") else "Exclusion"
+        parts.append(f"[{tag}] {desc}")
+
+    return "\n".join(parts)
+
+
+def fetch_nci_trials(reporter: Reporter) -> List[Dict[str, Any]]:
+    """Pull breast-cancer trials with MN sites from the NCI CTRP API."""
+    reporter.step(2, "running", "Querying NCI Cancer.gov API...", title="NCI Cancer.gov API")
+
+    api_key = os.getenv("NCI_API_KEY")
+    if not api_key:
+        reporter.log("NCI_API_KEY not set — skipping NCI Cancer.gov source.", step=2)
+        reporter.step(
+            2, "error", "NCI_API_KEY not configured.", title="NCI Cancer.gov API"
+        )
+        return []
+
+    params = {
+        "current_trial_status": "Active",
+        "keyword": "breast cancer",
+        "sites.org_state_or_province": "MN",
+        "sites.recruitment_status": "ACTIVE",
+        "size": NCI_MAX_RESULTS,
+    }
+    reporter.log(
+        "Searching NCI CTRP for active breast cancer trials recruiting in Minnesota.",
+        step=2,
+    )
+    reporter.log(f"Request: GET {NCI_API_URL} (filters: MN, Active, breast cancer)", step=2)
+
+    headers = {
+        "x-api-key": api_key,
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "User-Agent": "TrialFind-MVP/0.1 (demo)",
+    }
+
+    max_attempts = 3
+    response = None
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        reporter.log(f"HTTP GET attempt {attempt}/{max_attempts}...", step=2)
+        try:
+            response = requests.get(NCI_API_URL, params=params, headers=headers, timeout=30)
+            response.raise_for_status()
+            reporter.log(
+                f"HTTP {response.status_code} received ({len(response.content)} bytes).",
+                step=2,
+            )
+            break
+        except Exception as exc:
+            last_error = exc
+            reporter.log(f"Attempt {attempt} failed: {exc}", step=2)
+            if attempt < max_attempts:
+                time.sleep(2)
+            else:
+                raise
+    if response is None:
+        raise RuntimeError(f"NCI CTRP request failed: {last_error}")
+
+    payload = response.json()
+    trials = payload.get("data", []) or []
+    reporter.log(
+        f"Parsed response. {payload.get('total', len(trials))} total match(es); "
+        f"taking first {len(trials)}.",
+        step=2,
+    )
+
+    normalized: List[Dict[str, Any]] = []
+    for idx, trial in enumerate(trials[:NCI_MAX_RESULTS], start=1):
+        sites = trial.get("sites") or []
+        best_site = _pick_best_nci_site(sites)
+        location_str = first_non_empty(
+            [_format_nci_location(best_site), best_site.get("org_city")],
+            "Location not listed",
+        )
+        if len(sites) > 1:
+            location_display = f"{location_str} (+{len(sites) - 1} more sites)"
+        else:
+            location_display = location_str
+
+        nct_id = (trial.get("nct_id") or "").strip()
+        nci_id = (trial.get("nci_id") or "").strip()
+        title = first_non_empty(
+            [trial.get("brief_title"), trial.get("official_title")], "Untitled NCI study"
+        )
+
+        contacts = _extract_nci_contacts(trial, best_site)
+        eligibility_blob = _summarize_nci_eligibility(trial.get("eligibility") or {})
+
+        trial_record = {
+            "nct_id": nct_id or None,
+            "nct_url": (
+                f"https://www.cancer.gov/research/participate/clinical-trials-search/v?id={nci_id}"
+                if nci_id
+                else (f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else "")
+            ),
+            "title": title,
+            "eligibility_criteria": truncate_text(eligibility_blob),
+            "location": location_display,
+            "sites_count": len(sites),
+            "phase": first_non_empty([trial.get("phase")], "Unknown"),
+            "summary": truncate_text(
+                first_non_empty(
+                    [trial.get("brief_summary"), trial.get("detail_description")]
+                )
+            ),
+            "source": "NCI Cancer.gov",
+            "contacts": contacts,
+        }
+        normalized.append(trial_record)
+        contact_summary = (
+            f"{len(contacts)} contact(s): {contacts[0].get('name') or '—'}"
+            if contacts
+            else "no contact listed"
+        )
+        reporter.log(
+            f"Normalized trial {idx}/{min(len(trials), NCI_MAX_RESULTS)}: "
+            f"{nct_id or nci_id or 'NCI?'} — {title[:80]} — {location_display} — {contact_summary}",
+            step=2,
+        )
+        reporter.trial(trial_record)
+
+    reporter.step(
+        2,
+        "complete",
+        f"Got {len(normalized)} trial(s) from NCI Cancer.gov.",
+        title="NCI Cancer.gov API",
+    )
+    return normalized
+
+
 def _looks_like_trial_row(row: Any) -> bool:
     if not isinstance(row, dict):
         return False
@@ -533,7 +781,7 @@ def _run_tinyfish_agent(
         state["last_event_at"] = time.time()
         reporter.log(
             f"[{tag}] started (run_id={state['run_id']}, elapsed={_elapsed()}).",
-            step=2,
+            step=3,
         )
 
     def on_streaming_url(evt):
@@ -541,20 +789,20 @@ def _run_tinyfish_agent(
         state["last_event_at"] = time.time()
         reporter.log(
             f"[{tag}] live browser stream: {state['streaming_url']}",
-            step=2,
+            step=3,
         )
 
     def on_progress(evt):
         state["progress_count"] += 1
         state["last_event_at"] = time.time()
         purpose = (getattr(evt, "purpose", "") or "").strip()
-        reporter.log(f"[{tag}] {purpose or '(working…)'}", step=2)
+        reporter.log(f"[{tag}] {purpose or '(working…)'}", step=3)
 
     def on_heartbeat(_evt):
         since = int(time.time() - state["last_event_at"])
         reporter.log(
             f"[{tag}] heartbeat (elapsed {_elapsed()}, idle {since}s)",
-            step=2,
+            step=3,
         )
 
     def on_complete(evt):
@@ -564,7 +812,7 @@ def _run_tinyfish_agent(
         state["last_event_at"] = time.time()
         state["done"] = True
         reporter.log(
-            f"[{tag}] complete: {state['final_status']}", step=2
+            f"[{tag}] complete: {state['final_status']}", step=3
         )
 
     stream = client.agent.stream(
@@ -680,7 +928,7 @@ def _fetch_mayo_search_list(
     """Phase A: one agent, returns a list of up to 3 {title,url,status,location}."""
     reporter.log(
         "Phase A: listing top 3 results from Mayo search page (single agent).",
-        step=2,
+        step=3,
     )
     raw = _run_tinyfish_agent(
         client,
@@ -702,7 +950,7 @@ def _fetch_mayo_search_list(
         if isinstance(r, dict) and (r.get("url") or "").strip()
     ]
     reporter.log(
-        f"Phase A done: {len(usable)} trial URL(s) to fan out on.", step=2
+        f"Phase A done: {len(usable)} trial URL(s) to fan out on.", step=3
     )
     return usable[:3]
 
@@ -718,12 +966,12 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     instead of:                  phaseA + sum(detail_latency).
     """
     reporter.step(
-        2,
+        3,
         "running",
         "Launching Tinyfish browser agent on Mayo Clinic (Phase A)...",
         title="Mayo Clinic browser agent (Tinyfish)",
     )
-    reporter.log(f"Target URL: {MAYO_SEARCH_URL}", step=2)
+    reporter.log(f"Target URL: {MAYO_SEARCH_URL}", step=3)
 
     api_key = os.getenv("TINYFISH_API_KEY")
     if not api_key:
@@ -738,7 +986,7 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     search_entries = _fetch_mayo_search_list(client, reporter)
     if not search_entries:
         reporter.step(
-            2,
+            3,
             "complete",
             "Got 0 trial(s) from Mayo Clinic.",
             title="Mayo Clinic browser agent (Tinyfish)",
@@ -748,7 +996,7 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     # ── Phase B: fan out detail agents in parallel ─────────────────────
     max_workers = min(len(search_entries), max(1, MAYO_MAX_CONCURRENCY))
     reporter.step(
-        2,
+        3,
         "running",
         f"Phase B: scraping {len(search_entries)} detail page(s) with "
         f"{max_workers} parallel agent(s)...",
@@ -757,7 +1005,7 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     reporter.log(
         f"Phase B: dispatching {len(search_entries)} parallel Tinyfish "
         f"agent(s) (max_workers={max_workers}, cap={MAYO_MAX_CONCURRENCY}).",
-        step=2,
+        step=3,
     )
 
     trial_records: List[Optional[Dict[str, Any]]] = [None] * len(search_entries)
@@ -781,7 +1029,7 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
             detail = _parse_mayo_detail_blob(raw)
         except Exception as exc:
             reporter.log(
-                f"[{tag}] permanently failed: {exc}", step=2
+                f"[{tag}] permanently failed: {exc}", step=3
             )
             detail = {"eligibility_text": "", "summary_text": "", "contacts": []}
 
@@ -791,7 +1039,7 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
             f"[{tag}] finished in {elapsed_ms} ms "
             f"(eligibility={len(str(detail.get('eligibility_text') or ''))} chars, "
             f"contacts={contacts_found}).",
-            step=2,
+            step=3,
         )
         return detail
 
@@ -809,7 +1057,7 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
             reporter.trial(trial_record)
             completed += 1
             reporter.step(
-                2,
+                3,
                 "running",
                 f"Phase B: {completed}/{len(search_entries)} detail page(s) scraped…",
                 title="Mayo Clinic browser agent (Tinyfish)",
@@ -819,7 +1067,7 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
     reporter.log(
         f"Phase B complete: {completed}/{len(search_entries)} detail "
         f"page(s) in {total_ms} ms (parallel, max_workers={max_workers}).",
-        step=2,
+        step=3,
     )
 
     # Return in original search-order for stability (emission order was
@@ -829,7 +1077,7 @@ def fetch_mayo_trials(reporter: Reporter) -> List[Dict[str, Any]]:
         for i, r in enumerate(trial_records)
     ]
     reporter.step(
-        2,
+        3,
         "complete",
         f"Got {len(normalized)} trial(s) from Mayo Clinic.",
         title="Mayo Clinic browser agent (Tinyfish)",
@@ -953,7 +1201,7 @@ def _score_single_trial(
         reporter.log(
             f"Trial {trial_index + 1} ({title}…) — request attempt "
             f"{attempt}/{max_attempts}",
-            step=3,
+            step=4,
         )
         try:
             completion = client.chat.completions.create(
@@ -978,7 +1226,7 @@ def _score_single_trial(
             short_msg = "429 concurrency limit exceeded" if rate_limited else str(exc)
             reporter.log(
                 f"Trial {trial_index + 1} attempt {attempt} failed: {short_msg}",
-                step=3,
+                step=4,
             )
             if attempt < max_attempts:
                 # Exponential backoff with jitter. Longer for 429s, since
@@ -988,7 +1236,7 @@ def _score_single_trial(
                 delay = base * (2 ** (attempt - 1)) + random.uniform(0, 0.75)
                 reporter.log(
                     f"Trial {trial_index + 1} backing off {delay:.1f}s before retry.",
-                    step=3,
+                    step=4,
                 )
                 time.sleep(delay)
 
@@ -1018,7 +1266,7 @@ def score_trials_with_featherless(
     of the slowest single request (instead of the sum of all of them).
     """
     reporter.step(
-        3,
+        4,
         "running",
         f"Scoring {len(trials)} trial(s) with Featherless AI in parallel...",
         title="Featherless AI scoring",
@@ -1026,7 +1274,7 @@ def score_trials_with_featherless(
 
     if not trials:
         reporter.step(
-            3, "complete", "No trials to score.", title="Featherless AI scoring"
+            4, "complete", "No trials to score.", title="Featherless AI scoring"
         )
         return []
 
@@ -1045,7 +1293,7 @@ def score_trials_with_featherless(
         f"Dispatching {len(trials)} scoring request(s) to "
         f"{FEATHERLESS_MODEL} (max_workers={max_workers}, "
         f"plan cap={FEATHERLESS_MAX_CONCURRENCY}).",
-        step=3,
+        step=4,
     )
 
     scores: List[Optional[Dict[str, Any]]] = [None] * len(trials)
@@ -1059,7 +1307,7 @@ def score_trials_with_featherless(
         except Exception as exc:
             reporter.log(
                 f"Trial {idx + 1} permanently failed after retries: {exc}",
-                step=3,
+                step=4,
             )
             score = _fallback_score(idx, str(exc))
 
@@ -1068,7 +1316,7 @@ def score_trials_with_featherless(
             f"Trial {idx + 1} scored "
             f"({score.get('match_score', '—')} / {score.get('match_level', '—')}) "
             f"in {elapsed_ms} ms.",
-            step=3,
+            step=4,
         )
         return score
 
@@ -1090,7 +1338,7 @@ def score_trials_with_featherless(
 
             completed += 1
             reporter.step(
-                3,
+                4,
                 "running",
                 f"Scored {completed}/{len(trials)} trial(s) in parallel…",
                 title="Featherless AI scoring",
@@ -1100,10 +1348,10 @@ def score_trials_with_featherless(
     reporter.log(
         f"All {len(trials)} trial(s) scored in {total_elapsed_ms} ms total "
         f"(parallel, max_workers={max_workers}).",
-        step=3,
+        step=4,
     )
     reporter.step(
-        3,
+        4,
         "complete",
         f"Scored {len(trials)} trial(s) in parallel.",
         title="Featherless AI scoring",
@@ -1184,17 +1432,45 @@ def spa_fallback(path: str) -> Response:
     return _serve_index()
 
 
+def _dedupe_trials_by_nct_id(
+    trials: List[Dict[str, Any]], reporter: Reporter
+) -> List[Dict[str, Any]]:
+    """Collapse duplicate studies across sources by their NCT id.
+
+    When two sources return the same NCT id (common for ClinicalTrials.gov
+    and NCI CTRP) we keep the first occurrence — earlier sources (ctgov)
+    already have patient-location-aware site selection — and drop the
+    duplicates. Trials without an nct_id (e.g. Mayo rows) are always kept.
+    """
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    dropped = 0
+    for trial in trials:
+        nct = (trial.get("nct_id") or "").strip().upper()
+        if nct:
+            if nct in seen:
+                dropped += 1
+                continue
+            seen.add(nct)
+        out.append(trial)
+    if dropped:
+        reporter.log(f"De-duplicated {dropped} overlapping trial(s) by NCT id.")
+    return out
+
+
 def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
     started = time.time()
     errors: List[str] = []
 
     clinical_trials: List[Dict[str, Any]] = []
+    nci_trials: List[Dict[str, Any]] = []
     mayo_trials: List[Dict[str, Any]] = []
     scored_trials: List[Dict[str, Any]] = []
 
     reporter.step(1, "pending", "Idle.", title="ClinicalTrials.gov API")
-    reporter.step(2, "pending", "Idle.", title="Mayo Clinic browser agent (Tinyfish)")
-    reporter.step(3, "pending", "Idle.", title="Featherless AI scoring")
+    reporter.step(2, "pending", "Idle.", title="NCI Cancer.gov API")
+    reporter.step(3, "pending", "Idle.", title="Mayo Clinic browser agent (Tinyfish)")
+    reporter.step(4, "pending", "Idle.", title="Featherless AI scoring")
     reporter.log("Pipeline started.")
 
     prewarm_featherless(reporter)
@@ -1208,34 +1484,44 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         reporter.step(1, "error", str(exc), title="ClinicalTrials.gov API")
 
     try:
-        mayo_trials = fetch_mayo_trials(reporter)
+        nci_trials = fetch_nci_trials(reporter)
     except Exception as exc:
         msg = f"Step 2 failed: {exc}"
         errors.append(msg)
         reporter.log(msg, step=2)
-        reporter.step(2, "error", str(exc), title="Mayo Clinic browser agent (Tinyfish)")
+        reporter.step(2, "error", str(exc), title="NCI Cancer.gov API")
 
-    raw_trials = clinical_trials + mayo_trials
+    try:
+        mayo_trials = fetch_mayo_trials(reporter)
+    except Exception as exc:
+        msg = f"Step 3 failed: {exc}"
+        errors.append(msg)
+        reporter.log(msg, step=3)
+        reporter.step(3, "error", str(exc), title="Mayo Clinic browser agent (Tinyfish)")
+
+    combined = clinical_trials + nci_trials + mayo_trials
+    raw_trials = _dedupe_trials_by_nct_id(combined, reporter)
     reporter.log(
-        f"Combined raw trials: {len(raw_trials)} "
-        f"(ClinicalTrials.gov={len(clinical_trials)}, Mayo={len(mayo_trials)})"
+        f"Combined raw trials: {len(raw_trials)} unique "
+        f"(ClinicalTrials.gov={len(clinical_trials)}, NCI={len(nci_trials)}, "
+        f"Mayo={len(mayo_trials)})"
     )
 
     if raw_trials:
         try:
-            # score_trials_with_featherless() now dispatches one parallel
-            # request per trial and emits `scored_added` events to the
-            # Reporter the moment each one lands, so we don't re-emit here.
+            # score_trials_with_featherless() dispatches one parallel request
+            # per trial and emits `scored_added` events to the Reporter the
+            # moment each one lands, so we don't re-emit here.
             scores = score_trials_with_featherless(raw_trials, reporter)
             scored_trials = merge_trials_with_scores(raw_trials, scores)
         except Exception as exc:
-            msg = f"Step 3 failed: {exc}"
+            msg = f"Step 4 failed: {exc}"
             errors.append(msg)
-            reporter.log(msg, step=3)
-            reporter.step(3, "error", str(exc), title="Featherless AI scoring")
+            reporter.log(msg, step=4)
+            reporter.step(4, "error", str(exc), title="Featherless AI scoring")
             scored_trials = []
     else:
-        reporter.step(3, "error", "No trials to score.", title="Featherless AI scoring")
+        reporter.step(4, "error", "No trials to score.", title="Featherless AI scoring")
 
     elapsed_ms = int((time.time() - started) * 1000)
     reporter.log(f"All steps finished in {elapsed_ms} ms.")
@@ -1246,6 +1532,7 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
         "meta": {
             "counts": {
                 "clinicaltrials_gov": len(clinical_trials),
+                "nci_cancer_gov": len(nci_trials),
                 "mayo_clinic": len(mayo_trials),
                 "total_raw": len(raw_trials),
                 "total_scored": len(scored_trials),

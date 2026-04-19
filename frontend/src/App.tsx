@@ -1,9 +1,9 @@
 import { Header } from "./components/Header";
 import { HeroCard } from "./components/HeroCard";
-import { LogPanel } from "./components/LogPanel";
 import { PipelinePanel } from "./components/PipelinePanel";
 import { RawTrialsPanel } from "./components/RawTrialsPanel";
 import { ScoredMatchesTable } from "./components/ScoredMatchesTable";
+import { StatusTicker } from "./components/StatusTicker";
 import { useTrialStream } from "./hooks/useTrialStream";
 
 export default function App() {
@@ -23,7 +23,7 @@ export default function App() {
 
         <PipelinePanel steps={stream.steps} />
 
-        <LogPanel logs={stream.logs} onClear={stream.clearLogs} />
+        <StatusTicker logs={stream.logs} running={stream.running} />
 
         <ScoredMatchesTable scored={stream.scored} running={stream.running} />
 

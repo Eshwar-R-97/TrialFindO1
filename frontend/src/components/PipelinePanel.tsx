@@ -83,8 +83,8 @@ export function StepCard({ state, index }: { state: StepState; index: number }) 
 
 export function PipelinePanel({ steps }: { steps: StepState[] }) {
   return (
-    <Panel title="Pipeline" subtitle="Three steps, each streams in real time.">
-      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+    <Panel title="Pipeline" subtitle="Four steps, each streams in real time.">
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         {steps.map((s, i) => (
           <StepCard key={s.step} state={s} index={i} />
         ))}
