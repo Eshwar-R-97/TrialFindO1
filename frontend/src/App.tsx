@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { DocumentUploadCard } from "./components/DocumentUploadCard";
 import { Header } from "./components/Header";
-import { HeroCard } from "./components/HeroCard";
 import { ScoredMatchesTable } from "./components/ScoredMatchesTable";
 import { StatusTicker } from "./components/StatusTicker";
 import { useTrialStream } from "./hooks/useTrialStream";
