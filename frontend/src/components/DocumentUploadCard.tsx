@@ -192,48 +192,47 @@ function ExtractedProfileView({
   ];
 
   return (
-    <div className="mt-5 space-y-4">
+    <div className="mt-6 space-y-4">
       <PatientProfileGapForm
         key={missingFields.join("|")}
         missingFields={missingFields}
         current={profile}
         onSave={onMergeProfile}
       />
-      <p className="text-xs text-muted-foreground">
+      <p className="text-xs text-gray-400">
         {meta.filename} · {pdfExtraction.page_count} page(s) ·{" "}
-        {meta.text_chars_extracted.toLocaleString()} chars · JSON to model:{" "}
-        {meta.json_chars_sent_to_model.toLocaleString()} chars
+        {meta.text_chars_extracted.toLocaleString()} chars extracted
         {meta.json_truncated_for_model ? " (shrunk to fit context)" : ""}
       </p>
-      <div className="rounded-xl border border-border/80 bg-slate-50/80 p-4 text-sm leading-relaxed text-foreground">
-        <p className="font-medium text-slate-600">Summary</p>
-        <p className="mt-1">{profile.summary}</p>
+      <div className="rounded-xl border border-gray-100 bg-gray-50 p-4 text-sm leading-relaxed">
+        <p className="font-semibold text-gray-500">Summary</p>
+        <p className="mt-1.5 text-gray-800">{profile.summary}</p>
       </div>
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-2.5">
         {chips.map((c) => (
           <div
             key={c.label}
-            className="flex min-w-[120px] flex-col rounded-xl border border-border/70 bg-slate-50/70 px-3.5 py-2"
+            className="flex min-w-[120px] flex-col rounded-xl border border-gray-100 bg-gray-50 px-4 py-2.5"
           >
-            <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">
+            <span className="text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
               {c.label}
             </span>
-            <span className="text-sm font-medium text-foreground">{c.value}</span>
+            <span className="mt-0.5 text-sm font-semibold text-gray-900">{c.value}</span>
           </div>
         ))}
       </div>
       {biomarkerEntries.length > 0 && (
         <div>
-          <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">
+          <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
             Biomarkers
           </p>
           <div className="flex flex-wrap gap-2">
             {biomarkerEntries.map(([k, v]) => (
               <span
                 key={k}
-                className="rounded-lg border border-border/70 bg-white px-2.5 py-1 text-xs"
+                className="rounded-lg border border-gray-100 bg-white px-2.5 py-1 text-xs text-gray-700"
               >
-                <span className="font-medium">{k}</span>: {v}
+                <span className="font-semibold">{k}</span>: {v}
               </span>
             ))}
           </div>
@@ -241,10 +240,10 @@ function ExtractedProfileView({
       )}
       {Array.isArray(profile.prior_treatments) && profile.prior_treatments.length > 0 && (
         <div>
-          <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">
+          <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
             Prior treatments
           </p>
-          <ul className="list-inside list-disc text-sm text-foreground">
+          <ul className="list-inside list-disc text-sm text-gray-700">
             {profile.prior_treatments.map((t) => (
               <li key={t}>{t}</li>
             ))}
@@ -253,17 +252,17 @@ function ExtractedProfileView({
       )}
       {Array.isArray(profile.comorbidities) && profile.comorbidities.length > 0 && (
         <div>
-          <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-slate-400">
+          <p className="mb-2 text-[10px] font-bold uppercase tracking-[0.1em] text-gray-400">
             Comorbidities
           </p>
-          <ul className="list-inside list-disc text-sm text-foreground">
+          <ul className="list-inside list-disc text-sm text-gray-700">
             {profile.comorbidities.map((c) => (
               <li key={c}>{c}</li>
             ))}
           </ul>
         </div>
       )}
-      <p className="rounded-lg border border-amber-200/80 bg-amber-50/90 px-3 py-2 text-sm text-amber-950">
+      <p className="rounded-xl border border-amber-100 bg-amber-50 px-4 py-3 text-sm text-amber-900">
         {profile.discuss_with_oncologist}
       </p>
     </div>
