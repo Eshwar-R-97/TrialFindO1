@@ -170,6 +170,8 @@ export interface ReadPdfMeta {
 
 export interface ReadPdfResponse {
   extracted_profile: PatientProfileExtracted;
+  /** Server hint: which fields are still empty and should be collected in the UI. */
+  missing_fields?: string[];
   pdf_extraction: PdfExtractionSummary;
   meta: ReadPdfMeta;
 }

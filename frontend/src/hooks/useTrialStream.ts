@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { apiUrl } from "../lib/apiBase";
 import type {
   FriendlyStatus,
   LogLine,
@@ -81,7 +82,7 @@ export function useTrialStream(): TrialStream {
     setStatusText("Running Step 1 → 2 → 3 → 4 …");
     finalPayloadRef.current = null;
 
-    const es = new EventSource("/find-trials-stream");
+    const es = new EventSource(apiUrl("/find-trials-stream"));
     sourceRef.current = es;
 
     es.onmessage = (event) => {

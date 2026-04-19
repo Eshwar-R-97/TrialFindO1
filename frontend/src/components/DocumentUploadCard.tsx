@@ -1,5 +1,7 @@
 import { FileText, Loader2 } from "lucide-react";
 import { useCallback, useState } from "react";
+import { apiUrl } from "../lib/apiBase";
+import { PatientProfileGapForm } from "./PatientProfileGapForm";
 import type { PatientProfileExtracted, ReadPdfResponse } from "../types";
 
 async function parseJsonResponse(
@@ -8,8 +10,9 @@ async function parseJsonResponse(
   const text = await res.text();
   if (!text.trim()) {
     throw new Error(
-      `Empty response (HTTP ${res.status}). If Flask is running, this is often a ` +
-        `dev-proxy timeout while Featherless reads the PDF — try again or use a smaller file.`
+      `Empty response (HTTP ${res.status}). A 404 usually means the request never reached ` +
+        `Flask (check Vite proxy and that python app.py is on :5050). Timeouts while waiting ` +
+        `for Featherless more often return 502 with a JSON body — not an empty 404.`
     );
   }
   try {
@@ -22,7 +25,12 @@ async function parseJsonResponse(
   }
 }
 
-export function DocumentUploadCard() {
+export interface DocumentUploadCardProps {
+  /** Fires when Featherless returns a profile; use to sync Hero + server-side pipeline. */
+  onProfileReady?: (profile: PatientProfileExtracted) => void;
+}
+
+export function DocumentUploadCard({ onProfileReady }: DocumentUploadCardProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ReadPdfResponse | null>(null);
@@ -35,7 +43,7 @@ export function DocumentUploadCard() {
     const body = new FormData();
     body.append("file", file);
     try {
-      const res = await fetch("/api/read-pdf", { method: "POST", body });
+      const res = await fetch(apiUrl("/read-pdf"), { method: "POST", body });
       const json = await parseJsonResponse(res);
       if (!res.ok) {
         throw new Error(json.error || res.statusText || "Request failed");
@@ -43,13 +51,53 @@ export function DocumentUploadCard() {
       if (!("extracted_profile" in json) || !json.extracted_profile) {
         throw new Error("Invalid response from server");
       }
-      setResult(json as ReadPdfResponse);
+      const ok = json as ReadPdfResponse;
+      setResult(ok);
+      if (ok.extracted_profile) {
+        onProfileReady?.(ok.extracted_profile);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [onProfileReady]);
+
+  const mergeProfile = useCallback(
+    async (patch: Record<string, string | number | string[]>) => {
+      const res = await fetch(apiUrl("/api/patient-profile"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      const text = await res.text();
+      if (!text.trim()) {
+        throw new Error(`Empty response (${res.status})`);
+      }
+      const data = JSON.parse(text) as {
+        extracted_profile?: PatientProfileExtracted;
+        missing_fields?: string[];
+        error?: string;
+      };
+      if (!res.ok) {
+        throw new Error(data.error || "Could not update profile");
+      }
+      if (!data.extracted_profile) {
+        throw new Error("Invalid response from server");
+      }
+      setResult((prev) =>
+        prev
+          ? {
+              ...prev,
+              extracted_profile: data.extracted_profile!,
+              missing_fields: data.missing_fields ?? [],
+            }
+          : null
+      );
+      onProfileReady?.(data.extracted_profile);
+    },
+    [onProfileReady]
+  );
 
   const profile = result?.extracted_profile;
 
@@ -101,6 +149,8 @@ export function DocumentUploadCard() {
           profile={profile}
           meta={result.meta}
           pdfExtraction={result.pdf_extraction}
+          missingFields={result.missing_fields ?? []}
+          onMergeProfile={mergeProfile}
         />
       )}
     </section>
@@ -111,10 +161,14 @@ function ExtractedProfileView({
   profile,
   meta,
   pdfExtraction,
+  missingFields,
+  onMergeProfile,
 }: {
   profile: PatientProfileExtracted;
   meta: ReadPdfResponse["meta"];
   pdfExtraction: ReadPdfResponse["pdf_extraction"];
+  missingFields: string[];
+  onMergeProfile: (patch: Record<string, string | number | string[]>) => Promise<void>;
 }) {
   const biomarkersRaw = profile.biomarkers;
   const biomarkerEntries = Object.entries(
@@ -139,6 +193,12 @@ function ExtractedProfileView({
 
   return (
     <div className="mt-5 space-y-4">
+      <PatientProfileGapForm
+        key={missingFields.join("|")}
+        missingFields={missingFields}
+        current={profile}
+        onSave={onMergeProfile}
+      />
       <p className="text-xs text-muted-foreground">
         {meta.filename} · {pdfExtraction.page_count} page(s) ·{" "}
         {meta.text_chars_extracted.toLocaleString()} chars · JSON to model:{" "}
