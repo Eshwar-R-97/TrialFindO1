@@ -155,6 +155,7 @@ export default function App() {
                     rawTrials={stream.rawTrials}
                     scored={stream.scored}
                     running={stream.running}
+                    patientGeo={stream.patientGeo}
                   />
                 </motion.div>
               </motion.div>

@@ -1,13 +1,23 @@
 import { Fragment, useMemo, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { ChevronRight, ExternalLink, Loader2, MapPin } from "lucide-react";
-import type { ScoredEntry, Trial } from "../types";
+import {
+  ArrowDown,
+  ArrowUp,
+  ArrowUpDown,
+  ChevronRight,
+  ExternalLink,
+  Loader2,
+  MapPin,
+} from "lucide-react";
+import type { GeoPoint, ScoredEntry, Trial } from "../types";
 import { Panel } from "./PipelinePanel";
 import { ContactCell, ContactList } from "./Contacts";
 import {
   cn,
   eligibilitySnippet,
   firstSentence,
+  formatMiles,
+  haversineMiles,
   trialLocationLabel,
   trialSourceUrl,
 } from "../lib/utils";
@@ -16,9 +26,47 @@ interface MatchRow {
   trial: Trial;
   scored: ScoredEntry | null;
   arrivalIdx: number;
+  /** Miles from the patient's anchor lat/lng, or null if unknown. */
+  distanceMi: number | null;
 }
 
-function ScoreChip({ score, level }: { score: number | string; level: string }) {
+// Single source of truth for the table's row ordering. We always sort by
+// exactly one column at a time; the string form makes the UI trivial to
+// drive and keeps the sort comparator easy to read.
+//   - score-desc (DEFAULT): highest match score first, unscored rows at
+//     the bottom in arrival order.
+//   - score-asc: lowest match score first (unscored still bottom).
+//   - distance-asc: closest to the patient first; no-geo rows at bottom.
+//   - distance-desc: farthest first; no-geo rows at bottom.
+type SortMode = "score-desc" | "score-asc" | "distance-asc" | "distance-desc";
+
+const DEFAULT_SORT: SortMode = "score-desc";
+
+// Score header click: flip between the two score directions, always
+// leaving "distance-*" states on Location clicks.
+function toggleScoreSort(cur: SortMode): SortMode {
+  return cur === "score-desc" ? "score-asc" : "score-desc";
+}
+
+// Location header click: first click starts a distance sort (closest),
+// second flips to farthest, third hands control back to the default
+// score ordering. This matches the Score toggle's two-state feel while
+// still offering an obvious "turn it off" path.
+function toggleDistanceSort(cur: SortMode): SortMode {
+  if (cur === "distance-asc") return "distance-desc";
+  if (cur === "distance-desc") return DEFAULT_SORT;
+  return "distance-asc";
+}
+
+function ScoreChip({
+  score,
+  level,
+  reason,
+}: {
+  score: number | string;
+  level: string;
+  reason?: string;
+}) {
   const normalized = (level || "low").toLowerCase();
   const styles: Record<string, string> = {
     high: "bg-emerald-100 text-emerald-800 ring-emerald-200",
@@ -32,6 +80,7 @@ function ScoreChip({ score, level }: { score: number | string; level: string }) 
       initial={{ scale: 0.85, opacity: 0 }}
       animate={{ scale: 1, opacity: 1 }}
       transition={{ type: "spring", stiffness: 400, damping: 28 }}
+      title={reason || undefined}
       className={cn(
         "inline-flex items-baseline gap-1.5 rounded-lg px-2.5 py-1 text-sm font-bold ring-1 ring-inset",
         levelClass
@@ -55,6 +104,71 @@ function ScoringPill() {
     >
       <Loader2 className="h-3 w-3 animate-spin" />
       Scoring…
+    </motion.span>
+  );
+}
+
+// Shared clickable-header button used by both the Score and Location
+// columns. It knows nothing about the underlying data — callers just pass
+// which sort directions "belong" to this column and which (if any) is
+// currently active, and we render the label + arrow + active styling.
+interface SortHeaderProps {
+  label: string;
+  ascLabel: string;
+  descLabel: string;
+  /** Currently-active direction on THIS column, or null if another column owns the sort. */
+  direction: "asc" | "desc" | null;
+  disabled?: boolean;
+  disabledTitle?: string;
+  enabledTitle?: string;
+  onToggle: () => void;
+}
+
+function SortHeader({
+  label,
+  ascLabel,
+  descLabel,
+  direction,
+  disabled = false,
+  disabledTitle,
+  enabledTitle,
+  onToggle,
+}: SortHeaderProps) {
+  const Icon =
+    direction === "asc" ? ArrowUp : direction === "desc" ? ArrowDown : ArrowUpDown;
+  const displayLabel =
+    direction === "asc" ? ascLabel : direction === "desc" ? descLabel : label;
+  const active = direction !== null;
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      disabled={disabled}
+      title={disabled ? disabledTitle : enabledTitle}
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-md px-1.5 py-1 -ml-1.5 text-[11px] font-bold uppercase tracking-[0.07em] transition-colors",
+        active
+          ? "bg-brand-50 text-brand-700 ring-1 ring-inset ring-brand-200"
+          : "text-gray-400 hover:bg-gray-100 hover:text-gray-600",
+        disabled && "cursor-not-allowed opacity-50 hover:bg-transparent"
+      )}
+    >
+      {displayLabel}
+      <Icon className="h-3 w-3" />
+    </button>
+  );
+}
+
+function DistanceChip({ miles }: { miles: number }) {
+  return (
+    <motion.span
+      layout
+      initial={{ opacity: 0, scale: 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      transition={{ duration: 0.2 }}
+      className="mt-1 inline-flex items-center gap-1 rounded-md bg-gray-100 px-2 py-0.5 text-[11px] font-semibold text-gray-600 ring-1 ring-inset ring-gray-200"
+    >
+      {formatMiles(miles)} away
     </motion.span>
   );
 }
@@ -174,10 +288,29 @@ interface ScoredMatchesTableProps {
   rawTrials: Trial[];
   scored: ScoredEntry[];
   running: boolean;
+  /** Patient anchor lat/lng; null until the backend emits `patient_geo`. */
+  patientGeo?: GeoPoint | null;
 }
 
-export function ScoredMatchesTable({ rawTrials, scored, running }: ScoredMatchesTableProps) {
+export function ScoredMatchesTable({
+  rawTrials,
+  scored,
+  running,
+  patientGeo,
+}: ScoredMatchesTableProps) {
   const [openId, setOpenId] = useState<string | null>(null);
+  const [sortMode, setSortMode] = useState<SortMode>(DEFAULT_SORT);
+
+  // Derive per-column "am I active, and in which direction?" flags for the
+  // SortHeader buttons. Exactly one of these is non-null at any time.
+  const scoreDirection: "asc" | "desc" | null =
+    sortMode === "score-desc" ? "desc" : sortMode === "score-asc" ? "asc" : null;
+  const distanceDirection: "asc" | "desc" | null =
+    sortMode === "distance-asc"
+      ? "asc"
+      : sortMode === "distance-desc"
+      ? "desc"
+      : null;
 
   const scoredByIndex = useMemo(() => {
     const m = new Map<number, ScoredEntry>();
@@ -188,23 +321,49 @@ export function ScoredMatchesTable({ rawTrials, scored, running }: ScoredMatches
   }, [scored]);
 
   const rows: MatchRow[] = useMemo(() => {
-    const all: MatchRow[] = rawTrials.map((trial, idx) => ({
-      trial,
-      scored: scoredByIndex.get(idx) ?? null,
-      arrivalIdx: idx,
-    }));
+    const all: MatchRow[] = rawTrials.map((trial, idx) => {
+      const geo = trial.geo;
+      const distanceMi =
+        patientGeo && geo ? haversineMiles(patientGeo, geo) : null;
+      return {
+        trial,
+        scored: scoredByIndex.get(idx) ?? null,
+        arrivalIdx: idx,
+        distanceMi,
+      };
+    });
+
+    if (sortMode === "distance-asc" || sortMode === "distance-desc") {
+      // Rows with no distance (no coords from source) always sink to the
+      // bottom so the user still sees them but they don't pollute the
+      // ordered-by-distance section.
+      return all.sort((a, b) => {
+        const aHas = a.distanceMi != null;
+        const bHas = b.distanceMi != null;
+        if (aHas !== bHas) return aHas ? -1 : 1;
+        if (!aHas && !bHas) return a.arrivalIdx - b.arrivalIdx;
+        const diff = (a.distanceMi as number) - (b.distanceMi as number);
+        return sortMode === "distance-asc" ? diff : -diff;
+      });
+    }
+
+    // Score modes: unscored rows always sink to the bottom (by arrival) —
+    // a "still scoring" row isn't a low score, it's unknown, so we don't
+    // want it mixed in regardless of direction. Among scored rows the
+    // direction flag flips the compare.
+    const dir = sortMode === "score-desc" ? -1 : 1;
     return all.sort((a, b) => {
       const aScored = a.scored !== null;
       const bScored = b.scored !== null;
       if (aScored !== bScored) return aScored ? -1 : 1;
       if (aScored && bScored) {
-        return (
-          (b.scored!.score.match_score ?? -1) - (a.scored!.score.match_score ?? -1)
-        );
+        const aScore = a.scored!.score.match_score ?? 0;
+        const bScore = b.scored!.score.match_score ?? 0;
+        return dir * (aScore - bScore);
       }
       return a.arrivalIdx - b.arrivalIdx;
     });
-  }, [rawTrials, scoredByIndex]);
+  }, [rawTrials, scoredByIndex, sortMode, patientGeo]);
 
   const toggle = (id: string) => setOpenId((cur) => (cur === id ? null : id));
   const getId = (row: MatchRow) =>
@@ -235,25 +394,43 @@ export function ScoredMatchesTable({ rawTrials, scored, running }: ScoredMatches
             <table className="w-full border-collapse text-sm">
               <thead>
                 <tr className="border-b border-gray-100 bg-gray-50/80">
-                  {[
-                    { label: "Score", cls: "w-[120px] whitespace-nowrap" },
-                    { label: "Source", cls: "w-[140px] whitespace-nowrap" },
-                    { label: "Title", cls: "min-w-[280px]" },
-                    { label: "One-line summary", cls: "min-w-[240px]" },
-                    { label: "Location", cls: "min-w-[160px]" },
-                    { label: "Contact", cls: "min-w-[200px]" },
-                    { label: "Eligibility", cls: "min-w-[220px]" },
-                  ].map((c) => (
-                    <th
-                      key={c.label}
-                      className={cn(
-                        "px-4 py-3 text-left text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400",
-                        c.cls
-                      )}
-                    >
-                      {c.label}
-                    </th>
-                  ))}
+                  <th className="w-[120px] whitespace-nowrap px-4 py-3 text-left text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400">
+                    <SortHeader
+                      label="Score"
+                      ascLabel="Score · lowest first"
+                      descLabel="Score · highest first"
+                      direction={scoreDirection}
+                      enabledTitle="Click to flip highest ↔ lowest score"
+                      onToggle={() => setSortMode(toggleScoreSort)}
+                    />
+                  </th>
+                  <th className="w-[140px] whitespace-nowrap px-4 py-3 text-left text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400">
+                    Source
+                  </th>
+                  <th className="min-w-[280px] px-4 py-3 text-left text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400">
+                    Title
+                  </th>
+                  <th className="min-w-[240px] px-4 py-3 text-left text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400">
+                    One-line summary
+                  </th>
+                  <th className="min-w-[180px] px-4 py-3 text-left text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400">
+                    <SortHeader
+                      label="Location"
+                      ascLabel="Location · closest first"
+                      descLabel="Location · farthest first"
+                      direction={distanceDirection}
+                      disabled={!patientGeo}
+                      disabledTitle="Waiting for your location from the uploaded report…"
+                      enabledTitle="Click to sort by distance from your location"
+                      onToggle={() => setSortMode(toggleDistanceSort)}
+                    />
+                  </th>
+                  <th className="min-w-[200px] px-4 py-3 text-left text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400">
+                    Contact
+                  </th>
+                  <th className="min-w-[220px] px-4 py-3 text-left text-[11px] font-bold uppercase tracking-[0.07em] text-gray-400">
+                    Eligibility
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -287,7 +464,18 @@ export function ScoredMatchesTable({ rawTrials, scored, running }: ScoredMatches
                         >
                           <td className="px-4 py-3.5">
                             {score ? (
-                              <ScoreChip score={score.match_score ?? "–"} level={level} />
+                              <div className="flex flex-col gap-1.5">
+                                <ScoreChip
+                                  score={score.match_score ?? "–"}
+                                  level={level}
+                                  reason={score.score_reason}
+                                />
+                                {score.score_reason && (
+                                  <p className="text-[11px] leading-snug text-gray-500">
+                                    {score.score_reason}
+                                  </p>
+                                )}
+                              </div>
                             ) : (
                               <ScoringPill />
                             )}
@@ -317,10 +505,15 @@ export function ScoredMatchesTable({ rawTrials, scored, running }: ScoredMatches
                           </td>
                           <td className="px-4 py-3.5 text-gray-500">{summary}</td>
                           <td className="px-4 py-3.5">
-                            <span className="inline-flex items-start gap-1.5 text-gray-500">
-                              <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-gray-300" />
-                              <span>{trialLocationLabel(trial)}</span>
-                            </span>
+                            <div className="flex flex-col items-start gap-0.5">
+                              <span className="inline-flex items-start gap-1.5 text-gray-500">
+                                <MapPin className="mt-0.5 h-3.5 w-3.5 shrink-0 text-gray-300" />
+                                <span>{trialLocationLabel(trial)}</span>
+                              </span>
+                              {row.distanceMi != null && (
+                                <DistanceChip miles={row.distanceMi} />
+                              )}
+                            </div>
                           </td>
                           <td className="px-4 py-3.5">
                             <ContactCell contacts={trial.contacts} />

@@ -497,7 +497,13 @@ h1, h2, h3, h4 { margin: 0; color: var(--text); font-weight: 600; letter-spacing
   line-height: 1.5;
 }
 
-.col-score { width: 92px; white-space: nowrap; }
+.col-score { width: 160px; }
+.col-score .score-reason {
+  margin: 0.4rem 0 0;
+  font-size: 0.72rem;
+  line-height: 1.3;
+  color: var(--gray-500, #6b7280);
+}
 .col-source { width: 150px; white-space: nowrap; }
 .col-title { min-width: 300px; max-width: 420px; }
 .col-summary { min-width: 280px; max-width: 460px; }

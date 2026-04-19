@@ -96,6 +96,15 @@ class Reporter:
             }
         )
 
+    def patient_geo(self, geo: Optional[Dict[str, float]]) -> None:
+        """Emit the patient's lat/lng so the UI can compute per-trial distance.
+
+        Sent once near the start of a pipeline run. `geo` may be None if we
+        couldn't resolve the patient's ZIP to coordinates (the frontend then
+        falls back to a sensible default for the distance-sort feature).
+        """
+        self._emit({"type": "patient_geo", "geo": geo})
+
     def trial(self, trial: Dict[str, Any]) -> None:
         """Emit a single raw trial as soon as it's normalized.
 
@@ -625,6 +634,89 @@ def pick_best_location(
     return locations[0]
 
 
+def _coerce_lat_lng(lat: Any, lng: Any) -> Optional[Dict[str, float]]:
+    """Coerce a pair of lat/lng values into a `{lat, lng}` dict, or None.
+
+    Accepts strings or numbers; rejects non-finite / out-of-range values so
+    the frontend can safely compute haversine distances without guard code.
+    """
+    try:
+        if lat is None or lng is None:
+            return None
+        f_lat = float(lat)
+        f_lng = float(lng)
+    except (TypeError, ValueError):
+        return None
+    if not (-90.0 <= f_lat <= 90.0 and -180.0 <= f_lng <= 180.0):
+        return None
+    if f_lat == 0.0 and f_lng == 0.0:
+        # Null Island is almost always bogus placeholder data for a US trial.
+        return None
+    return {"lat": f_lat, "lng": f_lng}
+
+
+def _ctgov_location_geo(location: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """Extract lat/lng from a ClinicalTrials.gov v2 location entry.
+
+    CT.gov returns `geoPoint: {lat, lon}` on each site. We tolerate the
+    dict being missing or the inner fields being strings.
+    """
+    if not isinstance(location, dict):
+        return None
+    gp = location.get("geoPoint")
+    if isinstance(gp, dict):
+        return _coerce_lat_lng(gp.get("lat"), gp.get("lon") or gp.get("lng"))
+    return None
+
+
+def _nci_site_geo(site: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """Extract lat/lng from an NCI CTRP site entry.
+
+    The API has used several shapes over the years; handle the common ones:
+    `org_coordinates: {lat, lon}`, flat `org_coordinates_lat/lon`, and
+    `org_postal_code` geo (which we ignore — only the site coords matter).
+    """
+    if not isinstance(site, dict):
+        return None
+    oc = site.get("org_coordinates")
+    if isinstance(oc, dict):
+        geo = _coerce_lat_lng(oc.get("lat"), oc.get("lon") or oc.get("lng"))
+        if geo:
+            return geo
+    return _coerce_lat_lng(
+        site.get("org_coordinates_lat"),
+        site.get("org_coordinates_lon") or site.get("org_coordinates_lng"),
+    )
+
+
+# Coordinates for Mayo's main campuses. The Mayo browser scrape returns a
+# free-text location string (it has no structured geo), so we match on the
+# city keyword to get coordinates good enough for a "closest/farthest" sort.
+_MAYO_CAMPUS_COORDS: Dict[str, Dict[str, float]] = {
+    "rochester": {"lat": 44.0220984, "lng": -92.4665},
+    "phoenix": {"lat": 33.5722, "lng": -112.0893},
+    "scottsdale": {"lat": 33.6078, "lng": -111.9090},
+    "jacksonville": {"lat": 30.2668, "lng": -81.4648},
+    "london": {"lat": 51.5207, "lng": -0.1518},
+}
+
+
+def _mayo_geo_from_text(text: str) -> Optional[Dict[str, float]]:
+    """Best-effort lat/lng for a Mayo trial from its free-text location.
+
+    If the location string mentions one of Mayo's known campus cities we
+    return those coordinates. Otherwise None — the row will just sort to
+    the "no distance" bucket on the frontend.
+    """
+    low = (text or "").lower()
+    if not low:
+        return None
+    for city, coords in _MAYO_CAMPUS_COORDS.items():
+        if city in low:
+            return coords
+    return None
+
+
 def _normalize_contact(raw: Dict[str, Any], fallback_role: str = "") -> Dict[str, str]:
     """Turn a ClinicalTrials.gov contact dict into our trimmed, display-ready shape."""
     if not isinstance(raw, dict):
@@ -781,6 +873,7 @@ def fetch_clinical_trials(
             ),
             "source": "ClinicalTrials.gov",
             "contacts": contacts,
+            "geo": _ctgov_location_geo(best_location),
         }
         normalized.append(trial_record)
         contact_summary = (
@@ -1041,6 +1134,7 @@ def fetch_nci_trials(
             ),
             "source": "NCI Cancer.gov",
             "contacts": contacts,
+            "geo": _nci_site_geo(best_site),
         }
         normalized.append(trial_record)
         contact_summary = (
@@ -1361,6 +1455,7 @@ def _build_mayo_trial_record(
         "source": "Mayo Clinic",
         "mayo_url": url,
         "contacts": contacts,
+        "geo": _mayo_geo_from_text(location) or _mayo_geo_from_text(title),
     }
 
 
@@ -1680,6 +1775,13 @@ Return ONE JSON object (not an array) with EXACTLY these keys:
 - trial_index: integer — echo back {trial_index}.
 - match_score: integer 0-100.
 - match_level: one of "high", "medium", "low".
+- score_reason: ONE short sentence (max ~15 words) in plain second-person
+  English explaining WHY this exact score was given. This is the tooltip
+  the patient sees under the score chip, so it must be concrete and
+  specific to THIS trial + THIS patient (e.g. "Matches your HER2-positive
+  breast cancer and age, but the site is far from your ZIP."). Do NOT
+  just restate the level ("This is a medium match.") — name the driving
+  factor(s).
 - rationale: 1-2 sentences written TO the patient ("you"), in plain
   language, explaining why this trial might or might not fit them. Keep
   important medical terms but briefly explain them. Avoid words like
@@ -2014,6 +2116,7 @@ def _fallback_score(trial_index: int, reason: str) -> Dict[str, Any]:
         "trial_index": trial_index,
         "match_score": None,
         "match_level": "low",
+        "score_reason": "We couldn't score this trial right now.",
         "rationale": f"Scoring failed: {reason}",
         "key_eligibility_factors": [],
         "potential_exclusions": [],
@@ -2408,6 +2511,18 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
             "Using the patient profile from your uploaded PDF for trial matching."
         )
 
+    # Resolve the patient's ZIP to a lat/lng and emit it to the UI up front.
+    # This lets the frontend render per-row distance chips and a "sort by
+    # closest/farthest" toggle on the Location column as trials stream in.
+    # Fallback: Minneapolis (same default we use for the CT.gov geo filter).
+    _zm = _lookup_zip_metadata(_patient_zip_string(patient))
+    _patient_geo: Optional[Dict[str, float]] = None
+    if _zm.get("lat") is not None and _zm.get("lon") is not None:
+        _patient_geo = {"lat": float(_zm["lat"]), "lng": float(_zm["lon"])}
+    else:
+        _patient_geo = {"lat": 44.9778, "lng": -93.2650}
+    reporter.patient_geo(_patient_geo)
+
     prewarm_featherless(reporter)
 
     # Stand the async per-trial scorer up BEFORE any fetch step runs, and
@@ -2508,6 +2623,7 @@ def _run_pipeline(reporter: Reporter) -> Dict[str, Any]:
 
     return {
         "patient_profile": patient,
+        "patient_geo": _patient_geo,
         "raw_trials": raw_trials,
         "scored_trials": scored_trials,
         "meta": {

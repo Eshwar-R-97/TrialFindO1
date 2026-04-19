@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl } from "../lib/apiBase";
 import type {
   FriendlyStatus,
+  GeoPoint,
   LogLine,
   PipelineResult,
   SSEEvent,
@@ -39,6 +40,9 @@ export interface TrialStream {
   friendlyStatus: FriendlyStatus | null;
   rawTrials: Trial[];
   scored: ScoredEntry[];
+  // Patient's resolved lat/lng for the current run (from their ZIP).
+  // Used by the Matches table to sort by distance-to-trial-site.
+  patientGeo: GeoPoint | null;
   elapsedMs: number | null;
   errors: string[];
   statusText: string;
@@ -55,6 +59,7 @@ export function useTrialStream(): TrialStream {
   );
   const [rawTrials, setRawTrials] = useState<Trial[]>([]);
   const [scored, setScored] = useState<ScoredEntry[]>([]);
+  const [patientGeo, setPatientGeo] = useState<GeoPoint | null>(null);
   const [elapsedMs, setElapsedMs] = useState<number | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
   const [statusText, setStatusText] = useState<string>(
@@ -77,6 +82,7 @@ export function useTrialStream(): TrialStream {
     setFriendlyStatus(null);
     setRawTrials([]);
     setScored([]);
+    setPatientGeo(null);
     setElapsedMs(null);
     setErrors([]);
     setStatusText("Running Step 1 → 2 → 3 → 4 …");
@@ -126,6 +132,10 @@ export function useTrialStream(): TrialStream {
           setRawTrials((prev) => [...prev, data.trial]);
           break;
         }
+        case "patient_geo": {
+          setPatientGeo(data.geo ?? null);
+          break;
+        }
         case "scored_added": {
           setScored((prev) =>
             [...prev, data.entry].sort(
@@ -150,6 +160,10 @@ export function useTrialStream(): TrialStream {
           finalPayloadRef.current = data.payload;
           setElapsedMs(data.payload.meta?.elapsed_ms ?? null);
           setErrors(data.payload.meta?.errors ?? []);
+          // The `patient_geo` SSE event arrives before `result` in normal
+          // runs, but if a client reconnects mid-stream the result payload
+          // is the belt-and-suspenders copy.
+          if (data.payload.patient_geo) setPatientGeo(data.payload.patient_geo);
           break;
         }
         case "done": {
@@ -190,6 +204,7 @@ export function useTrialStream(): TrialStream {
     friendlyStatus,
     rawTrials,
     scored,
+    patientGeo,
     elapsedMs,
     errors,
     statusText,

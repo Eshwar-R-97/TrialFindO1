@@ -198,11 +198,13 @@ function buildScoredRows({ trial, score }) {
   const main = document.createElement("tr");
   main.className = "trial-row";
   main.dataset.score = String(scoreNumeric(score));
+  const reason = score.score_reason || "";
   main.innerHTML = `
     <td class="col-score">
-      <span class="score-chip level-${escapeHtml(level)}">
+      <span class="score-chip level-${escapeHtml(level)}"${reason ? ` title="${escapeHtml(reason)}"` : ""}>
         ${escapeHtml(scoreNum)}<small>${escapeHtml(level)}</small>
       </span>
+      ${reason ? `<p class="score-reason">${escapeHtml(reason)}</p>` : ""}
     </td>
     <td class="col-source">
       <span class="trial-source-tag">${escapeHtml(trial.source || "Unknown")}</span>
