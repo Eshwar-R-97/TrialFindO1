@@ -290,24 +290,33 @@ function GapFormInner({
 
               {/* Field groups */}
               <div className="space-y-6">
-                {visibleGroups.map(({ group, fields }) => (
-                  <div key={group}>
-                    <p className="mb-3 text-[11px] font-bold uppercase tracking-[0.15em] text-gray-400">
-                      {group}
-                    </p>
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      {fields.map((fd) => (
-                        <FieldInput
-                          key={fd.key}
-                          def={fd}
-                          value={values[fd.key] ?? ""}
-                          onChange={(v) => setValue(fd.key, v)}
-                          fullWidth={fd.type === "tags" || fd.key === "diagnosis"}
-                        />
-                      ))}
+                {visibleGroups.map(({ group, fields }) => {
+                  // Hide the group header when it would just duplicate the
+                  // lone field's own label (e.g. "Other Medical History" →
+                  // "Other Medical Conditions"). The field's bold label is
+                  // already clear on its own.
+                  const showGroupHeading = fields.length > 1;
+                  return (
+                    <div key={group}>
+                      {showGroupHeading && (
+                        <p className="mb-3 text-[11px] font-bold uppercase tracking-[0.15em] text-gray-400">
+                          {group}
+                        </p>
+                      )}
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {fields.map((fd) => (
+                          <FieldInput
+                            key={fd.key}
+                            def={fd}
+                            value={values[fd.key] ?? ""}
+                            onChange={(v) => setValue(fd.key, v)}
+                            fullWidth={fd.type === "tags" || fd.key === "diagnosis"}
+                          />
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
 
               {/* HIPAA consent */}
