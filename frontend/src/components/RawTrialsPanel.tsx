@@ -88,14 +88,6 @@ function RawTrialCard({ trial }: { trial: Trial }) {
                   <ContactList contacts={trial.contacts} />
                 </div>
               </div>
-              <div>
-                <p className="text-[10px] font-bold uppercase tracking-[0.07em] text-slate-500">
-                  Eligibility criteria
-                </p>
-                <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
-                  {trial.eligibility_criteria || "Not provided."}
-                </p>
-              </div>
               {url && (
                 <a
                   href={url}

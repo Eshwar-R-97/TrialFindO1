@@ -103,9 +103,11 @@ FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
 FEATHERLESS_MAX_CONCURRENCY = int(os.getenv("FEATHERLESS_MAX_CONCURRENCY", "4"))
 
 # How many Mayo Clinic detail pages to scrape in parallel. We launch one
-# Tinyfish browser agent per URL; 3 is a sensible default since we look at
-# the top 3 results, but you can bump it if you expand the search.
-MAYO_MAX_CONCURRENCY = int(os.getenv("MAYO_MAX_CONCURRENCY", "3"))
+# Tinyfish browser agent per URL. The default is 2 because Tinyfish plans
+# (observed empirically) seem to cap active browser sessions at 2 — going
+# higher just causes the 3rd agent to wait server-side for a free slot.
+# Bump this in your .env if your plan allows more simultaneous sessions.
+MAYO_MAX_CONCURRENCY = int(os.getenv("MAYO_MAX_CONCURRENCY", "2"))
 
 
 def prewarm_featherless(reporter: "Reporter") -> None:
@@ -517,6 +519,10 @@ def _run_tinyfish_agent(
         "result_json": None,
         "error": None,
         "progress_count": 0,
+        # Flipped to True by on_complete so the consumer loop can bail out
+        # instead of waiting for the SDK to also close the stream (which
+        # tacks ~30 seconds of heartbeats onto every agent otherwise).
+        "done": False,
     }
 
     def _elapsed() -> str:
@@ -556,6 +562,7 @@ def _run_tinyfish_agent(
         state["result_json"] = getattr(evt, "result_json", None)
         state["error"] = getattr(evt, "error", None)
         state["last_event_at"] = time.time()
+        state["done"] = True
         reporter.log(
             f"[{tag}] complete: {state['final_status']}", step=2
         )
@@ -569,7 +576,18 @@ def _run_tinyfish_agent(
         on_heartbeat=on_heartbeat,
         on_complete=on_complete,
     )
+    # Stop consuming the stream as soon as the agent signals completion.
+    # Without this we sit in the iterator for ~30 s of trailing heartbeats,
+    # which (for parallel runs) is also time we're holding a concurrency
+    # slot on the Tinyfish side.
     for _ in stream:
+        if state["done"]:
+            break
+    try:
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+    except Exception:
         pass
 
     if state["error"]:

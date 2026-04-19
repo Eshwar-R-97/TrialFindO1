@@ -115,14 +115,6 @@ function DetailRow({ entry }: { entry: ScoredEntry }) {
             <ContactList contacts={trial.contacts} />
           </div>
         </div>
-        <div>
-          <p className="text-[10px] font-bold uppercase tracking-[0.07em] text-slate-500">
-            Full eligibility text
-          </p>
-          <p className="mt-1 whitespace-pre-wrap text-muted-foreground">
-            {trial.eligibility_criteria || "Not provided."}
-          </p>
-        </div>
         <div className="flex flex-wrap items-center gap-3 pt-1 text-xs text-muted-foreground">
           <span>
             <span className="font-semibold text-foreground">Phase:</span>{" "}
