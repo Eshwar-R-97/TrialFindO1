@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Loader2, Search, Upload } from "lucide-react";
+import { Search, Upload } from "lucide-react";
 import { useEffect, useState } from "react";
 import { cn } from "../lib/utils";
 
@@ -62,53 +62,44 @@ export function Header({ running, onRun, hasProfile }: HeaderProps) {
 
         {/* Right actions */}
         <div className="flex items-center gap-3">
-          {running && (
+          {running ? (
             <motion.span
               initial={{ opacity: 0, scale: 0.9 }}
               animate={{ opacity: 1, scale: 1 }}
-              className="hidden items-center gap-1.5 rounded-full border border-brand-500/30 bg-brand-500/10 px-3 py-1 text-xs font-semibold text-brand-400 sm:inline-flex"
+              className="inline-flex items-center gap-1.5 rounded-full border border-brand-500/30 bg-brand-500/10 px-3 py-1 text-xs font-semibold text-brand-400"
             >
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-brand-400" />
               Searching…
             </motion.span>
+          ) : (
+            /* Tooltip wrapper — only shown when not actively searching */
+            <div className="group relative">
+              <motion.button
+                type="button"
+                onClick={onRun}
+                disabled={isDisabled}
+                whileHover={!isDisabled ? { scale: 1.03 } : undefined}
+                whileTap={!isDisabled ? { scale: 0.97 } : undefined}
+                className={cn(
+                  "inline-flex items-center gap-2 rounded-full px-5 py-2 text-sm font-semibold transition-all duration-200",
+                  !isDisabled
+                    ? "bg-brand-500 text-white shadow-glow-brand hover:bg-brand-400 hover:shadow-glow-brand-lg"
+                    : "cursor-not-allowed bg-white/8 text-white/30"
+                )}
+              >
+                <Search className="h-4 w-4" />
+                Find Trials
+              </motion.button>
+
+              {/* Tooltip — only shows when disabled due to no PDF */}
+              {!hasProfile && (
+                <div className="pointer-events-none absolute right-0 top-full mt-2 w-max rounded-lg border border-white/10 bg-surface-900 px-3 py-1.5 text-xs text-gray-400 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+                  <Upload className="mr-1.5 inline h-3 w-3" />
+                  Upload a PDF first
+                </div>
+              )}
+            </div>
           )}
-
-          {/* Tooltip wrapper */}
-          <div className="group relative">
-            <motion.button
-              type="button"
-              onClick={onRun}
-              disabled={isDisabled}
-              whileHover={!isDisabled ? { scale: 1.03 } : undefined}
-              whileTap={!isDisabled ? { scale: 0.97 } : undefined}
-              className={cn(
-                "inline-flex items-center gap-2 rounded-full px-5 py-2 text-sm font-semibold transition-all duration-200",
-                !isDisabled
-                  ? "bg-brand-500 text-white shadow-glow-brand hover:bg-brand-400 hover:shadow-glow-brand-lg"
-                  : "cursor-not-allowed bg-white/8 text-white/30"
-              )}
-            >
-              {running ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Searching…
-                </>
-              ) : (
-                <>
-                  <Search className="h-4 w-4" />
-                  Find Trials
-                </>
-              )}
-            </motion.button>
-
-            {/* Tooltip — only shows when disabled due to no PDF */}
-            {!hasProfile && !running && (
-              <div className="pointer-events-none absolute right-0 top-full mt-2 w-max rounded-lg border border-white/10 bg-surface-900 px-3 py-1.5 text-xs text-gray-400 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
-                <Upload className="mr-1.5 inline h-3 w-3" />
-                Upload a PDF first
-              </div>
-            )}
-          </div>
         </div>
       </div>
     </motion.header>

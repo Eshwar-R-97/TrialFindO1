@@ -9,7 +9,6 @@ import {
   Database,
   Lock,
   Mail,
-  Zap,
 } from "lucide-react";
 import { useState } from "react";
 import { DocumentUploadCard } from "./components/DocumentUploadCard";
@@ -32,12 +31,6 @@ const CLINIC_FEATURES = [
     title: "Multi-source aggregation",
     description:
       "Pull from ClinicalTrials.gov, pharma portals, and regional registries — all normalized in one API call.",
-  },
-  {
-    icon: Zap,
-    title: "EHR integration",
-    description:
-      "Connect directly with Epic, Cerner, and HL7 FHIR endpoints to match patients as records update.",
   },
   {
     icon: BarChart3,

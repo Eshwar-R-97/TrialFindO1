@@ -8,7 +8,7 @@ from urllib.parse import quote_plus, urlencode
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from queue import Queue
 from threading import Lock, Thread
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -1566,11 +1566,11 @@ def _fetch_mayo_search_list(
     reporter: Reporter,
     search_url: str,
     search_goal: str,
+    tag: str = "search",
 ) -> List[Dict[str, Any]]:
     """Phase A: one agent, returns a list of up to MAYO_MAX_TRIALS entries."""
     reporter.log(
-        f"Phase A: listing top {MAYO_MAX_TRIALS} results from Mayo "
-        f"search page (single agent).",
+        f"[{tag}] listing top {MAYO_MAX_TRIALS} results from Mayo search page.",
         step=3,
     )
     raw = _run_tinyfish_agent(
@@ -1578,11 +1578,11 @@ def _fetch_mayo_search_list(
         goal=search_goal,
         url=search_url,
         reporter=reporter,
-        tag="search",
+        tag=tag,
     )
     rows = parse_tinyfish_result(raw)
     reporter.log(
-        f"Phase A: Tinyfish returned {len(rows)} row(s) after parsing (before URL filter).",
+        f"[{tag}] returned {len(rows)} row(s) after parsing (before URL filter).",
         step=3,
     )
     # Keep only entries that have a usable url to fan out on.
@@ -1606,7 +1606,7 @@ def _fetch_mayo_search_list(
             }
         )
     reporter.log(
-        f"Phase A done: {len(usable)} trial URL(s) to fan out on.", step=3
+        f"[{tag}] produced {len(usable)} usable trial URL(s).", step=3
     )
     return usable[:MAYO_MAX_TRIALS]
 
@@ -1616,8 +1616,10 @@ def fetch_mayo_trials(
 ) -> List[Dict[str, Any]]:
     """Scrape Mayo Clinic trials using two phases:
 
-    Phase A — one agent that lists up to MAYO_MAX_TRIALS URLs from the
-              search page.
+    Phase A — race every keyword variant in parallel across every
+              configured Tinyfish API key (round-robin). The highest-
+              priority variant that returns non-empty wins; the rest of
+              the work is thrown away. Lists up to MAYO_MAX_TRIALS URLs.
     Phase B — one agent per URL, running in parallel across every configured
               Tinyfish API key (round-robin), each extracting eligibility /
               summary / contacts from a single detail page.
@@ -1639,39 +1641,114 @@ def fetch_mayo_trials(
         raise RuntimeError("TINYFISH_API_KEY is missing.")
 
     # One TinyFish client per API key. Each client gets its own quota /
-    # concurrency cap server-side, so distributing detail agents across
-    # clients is what actually unlocks real parallelism (as opposed to
-    # just bumping max_workers on a single key, which queues server-side).
+    # concurrency cap server-side, so distributing agents across clients
+    # is what actually unlocks real parallelism (as opposed to just
+    # bumping max_workers on a single key, which queues server-side).
     clients = [TinyFish(api_key=k) for k in api_keys]
-    # For single-shot Phase A we just use the first key; no point fanning.
-    client = clients[0]
     reporter.log(
         f"Tinyfish: {len(clients)} API key(s) configured — "
-        f"detail agents will round-robin across them.",
+        f"Phase A variants and Phase B details will round-robin across them.",
         step=3,
     )
 
-    # ── Phase A: get the list of URLs (retry with simpler keywords if empty) ──
+    # ── Phase A: race keyword variants in parallel across keys ──
+    # Historically Phase A tried one keyword at a time: if "HER2+ breast
+    # cancer" returned nothing, serially retry with "breast cancer", then
+    # "cancer". Each retry was another ~20s full Tinyfish agent run, so
+    # a double-miss cost ~60s. With multiple keys available we now launch
+    # every variant concurrently (one agent per URL, spread round-robin
+    # across keys) and pick the FIRST variant in priority order that came
+    # back non-empty. On the happy path (variant 1 works) wall-clock is
+    # unchanged; on misses we get max(variant_latencies) instead of sum.
     search_entries: List[Dict[str, Any]] = []
-    for attempt, kw in enumerate(keyword_variants, start=1):
+
+    # How many Phase-A variants we're willing to fire at once. Capped at
+    # `sessions_per_key × keys` so we never blow past any single key's
+    # concurrency budget (even if Phase A variants > keys). Usually this
+    # is ≥ len(keyword_variants), so one parallel batch covers everything.
+    phase_a_cap = max(1, TINYFISH_SESSIONS_PER_KEY * len(clients))
+
+    reporter.milestone(
+        f"Mayo Clinic search: racing {min(len(keyword_variants), phase_a_cap)} "
+        f"keyword variant(s) in parallel across {len(clients)} key(s)...",
+        step=3,
+    )
+
+    def _phase_a_try(
+        priority: int, kw: str
+    ) -> Tuple[int, str, List[Dict[str, Any]]]:
+        """Run ONE keyword variant on its assigned client. Returns the
+        (priority, keyword, entries) triple so the caller can pick the
+        highest-priority non-empty result across parallel runs."""
+        phase_a_client = clients[priority % len(clients)]
+        key_label = f"key{(priority % len(clients)) + 1}"
         kw_url = quote_plus(kw)
         may_url = _mayo_search_url(kw_url)
         may_goal = MAYO_SEARCH_GOAL_TEMPLATE.format(
             keyword_display=kw.replace('"', "'"),
             max_trials=MAYO_MAX_TRIALS,
         )
-        reporter.milestone(
-            f"Mayo Clinic search (try {attempt}/{len(keyword_variants)}): “{kw[:80]}”.",
+        reporter.log(
+            f"Phase A [{key_label}] variant {priority + 1}/"
+            f"{len(keyword_variants)} — “{kw[:60]}” → {may_url}",
             step=3,
         )
-        reporter.log(f"Mayo Phase A target URL: {may_url}", step=3)
-        search_entries = _fetch_mayo_search_list(
-            client, reporter, may_url, may_goal
+        try:
+            entries = _fetch_mayo_search_list(
+                phase_a_client, reporter, may_url, may_goal,
+                tag=f"search-{priority + 1}-{key_label}",
+            )
+        except Exception as exc:
+            reporter.log(
+                f"Phase A [{key_label}] variant {priority + 1} errored: {exc}",
+                step=3,
+            )
+            entries = []
+        return (priority, kw, entries)
+
+    # Chunk variants into batches of `phase_a_cap` — almost always just one
+    # batch in practice (≤5 variants, 6+ slots with 3 keys).
+    batches: List[List[Tuple[int, str]]] = []
+    current: List[Tuple[int, str]] = []
+    for idx, kw in enumerate(keyword_variants):
+        current.append((idx, kw))
+        if len(current) >= phase_a_cap:
+            batches.append(current)
+            current = []
+    if current:
+        batches.append(current)
+
+    for batch_num, batch in enumerate(batches, start=1):
+        reporter.log(
+            f"Phase A batch {batch_num}/{len(batches)}: dispatching "
+            f"{len(batch)} parallel search agent(s).",
+            step=3,
         )
-        if search_entries:
+        t0 = time.time()
+        results: List[Tuple[int, str, List[Dict[str, Any]]]] = []
+        with ThreadPoolExecutor(max_workers=len(batch)) as pool:
+            futures = [pool.submit(_phase_a_try, pri, kw) for pri, kw in batch]
+            for fut in as_completed(futures):
+                results.append(fut.result())
+        elapsed_ms = int((time.time() - t0) * 1000)
+
+        # Pick the non-empty result with the best (lowest) priority so we
+        # prefer the most specific keyword even though they all raced.
+        results.sort(key=lambda r: r[0])
+        winner = next((r for r in results if r[2]), None)
+
+        if winner is not None:
+            pri, kw, search_entries = winner
+            reporter.log(
+                f"Phase A: variant {pri + 1} (“{kw[:60]}”) won with "
+                f"{len(search_entries)} trial link(s) in {elapsed_ms} ms "
+                f"(batch of {len(batch)} raced in parallel).",
+                step=3,
+            )
             break
         reporter.log(
-            f"Mayo Phase A: no usable links for keyword {kw[:80]!r} — trying next variant.",
+            f"Phase A batch {batch_num}: all {len(batch)} variant(s) returned "
+            f"0 links in {elapsed_ms} ms — moving on.",
             step=3,
         )
 
