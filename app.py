@@ -2823,4 +2823,5 @@ def find_trials_stream():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5050"))
-    app.run(debug=True, port=port)
+    debug = os.getenv("FLASK_DEBUG", "").lower() in ("1", "true", "yes")
+    app.run(debug=debug, host="0.0.0.0", port=port)

@@ -227,3 +227,33 @@ Add a second TinyFish key (`TINYFISH_API_KEY_2`) to double parallel scraping cap
 
 **PDF extraction returns empty fields**
 The PDF must be machine-readable (not a scanned image). Medical summaries, discharge notes, or pathology reports work best.
+
+---
+
+## Deploy to Railway (demo)
+
+One service serves both the React UI (`frontend/dist`) and the Flask API.
+
+1. Push this repo to GitHub.
+2. [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub** → select the repo.
+3. Railway detects `Dockerfile` / `railway.toml` automatically.
+4. In the service **Variables** tab, add everything from your local `.env`:
+
+   | Variable | Notes |
+   |----------|--------|
+   | `FEATHERLESS_API_KEY` | required |
+   | `TINYFISH_API_KEY` | required |
+   | `NCI_API_KEY` | required |
+   | `VITE_SUPABASE_URL` | required at **build** time (baked into UI) |
+   | `VITE_SUPABASE_ANON_KEY` | required at **build** time |
+   | `SUPABASE_URL` / `SUPABASE_SERVICE_KEY` | only if you use `db.py` / cron |
+
+   Optional: `TINYFISH_API_KEY_2`, `MAYO_MAX_TRIALS`, etc. (see `.env.example`).
+
+5. **Deploy** → open the generated `*.up.railway.app` URL.
+
+**Notes**
+
+- `/find-trials-stream` uses SSE; the image runs gunicorn with `gthread` and a 300s timeout.
+- After changing `VITE_*` vars, trigger a **redeploy** so the frontend rebuilds.
+- Local dev is unchanged: `python app.py` (set `FLASK_DEBUG=1` for Flask debug mode).
